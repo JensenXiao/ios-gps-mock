@@ -234,6 +234,7 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
     private var autoReconnectWorkItem: DispatchWorkItem?
     private var reconnectAttempt: Int = 0
     private var userInitiatedDisconnect = false
+    private var expectedDvtStreamExit = false
     private var sentLocationCount: Int = 0
     private var activeTunnelConnectionType: TunnelConnectionType?
     private let privilegedTunnelLog = "/tmp/opaperclip_tunnel.log"
@@ -397,10 +398,30 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
                 appendLog("Wireless Mode：使用指定 UDID 建立 Wi‑Fi tunnel")
                 return requested
             }
+            if let connectedUDID = try preferredActiveDeviceUDID(using: cmd) {
+                appendLog("Wireless Mode：沿用目前已配對裝置建立 Wi‑Fi tunnel")
+                return connectedUDID
+            }
             appendLog("Wireless Mode：自動尋找可用的 Wi‑Fi 裝置")
             return nil
         }
         return try preferredTunnelUDID(using: cmd)
+    }
+
+    private func preferredActiveDeviceUDID(using cmd: [String]) throws -> String? {
+        let devices = try listConnectedDevices(using: cmd)
+        guard !devices.isEmpty else { return nil }
+
+        if let requested = effectiveTunnelUDID,
+           let matched = devices.first(where: { matchesDevice($0, requestedUDID: requested) }) {
+            return matched.identifier ?? matched.uniqueDeviceID
+        }
+
+        let preferredDevice =
+            devices.first(where: { ($0.connectionType ?? "").uppercased() == "USB" }) ??
+            devices.first
+
+        return preferredDevice?.identifier ?? preferredDevice?.uniqueDeviceID
     }
 
     private func preferredTunnelUDID(using cmd: [String]) throws -> String? {
@@ -905,6 +926,15 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
 
         try p.run()
 
+        p.terminationHandler = { [weak self] proc in
+            guard let self else { return }
+            out.fileHandleForReading.readabilityHandler = nil
+            err.fileHandleForReading.readabilityHandler = nil
+            if self.rsdEndpoint != nil && !self.userInitiatedDisconnect {
+                self.handleUnexpectedConnectionLoss(reason: "tunnel 行程已結束（code: \(proc.terminationStatus)）")
+            }
+        }
+
         tunnelProcess = p
         tunnelOutPipe = out
         tunnelErrPipe = err
@@ -953,6 +983,7 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
     }
 
     private func resetSendState() {
+        expectedDvtStreamExit = true
         dvtStream.stop()
         pendingCoordinate = nil
         inFlight = false
@@ -990,6 +1021,15 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
 
         stopPrivilegedTunnelProcessIfNeeded()
 
+    }
+
+    private func handleUnexpectedConnectionLoss(reason: String) {
+        guard !userInitiatedDisconnect else { return }
+        guard rsdEndpoint != nil || connectionState.isConnected else { return }
+        appendLog("連線中斷：\(reason)")
+        stopTunnel()
+        setConnectionState(.failed, deviceName: "連線已中斷", lastError: reason)
+        scheduleAutoReconnect(reason: reason)
     }
 
     @discardableResult
@@ -1135,6 +1175,8 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
             return
         }
 
+        expectedDvtStreamExit = false
+
         try dvtStream.start(
             host: host,
             port: port,
@@ -1145,7 +1187,13 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
                 self?.appendLog("dvt-stream err: \(self?.summarizeOutput(text, maxChars: 180) ?? text)")
             },
             onExit: { [weak self] status in
-                self?.appendLog("dvt-stream exited: \(status)")
+                guard let self else { return }
+                self.appendLog("dvt-stream exited: \(status)")
+                if self.expectedDvtStreamExit {
+                    self.expectedDvtStreamExit = false
+                    return
+                }
+                self.handleUnexpectedConnectionLoss(reason: "定位串流已中斷（code: \(status)）")
             }
         )
     }

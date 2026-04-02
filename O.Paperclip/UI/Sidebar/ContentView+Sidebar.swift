@@ -32,40 +32,30 @@ extension ContentView {
     }
 
     @ViewBuilder
-    var statusView: some View {
-        StatusViewSection(vm: vm, routeColors: routeColors)
-    }
-
-    @ViewBuilder
     var locationInputSection: some View {
         LocationInputSectionView(vm: vm, currentRegion: cameraPosition.region)
-    }
-
-    var tunnelUDIDBinding: Binding<String> {
-        Binding(
-            get: { vm.deviceManager.tunnelUDID },
-            set: { vm.deviceManager.tunnelUDID = $0 }
-        )
-    }
-
-    var manualRsdHostBinding: Binding<String> {
-        Binding(
-            get: { vm.deviceManager.manualRsdHost },
-            set: { vm.deviceManager.manualRsdHost = $0 }
-        )
-    }
-
-    var manualRsdPortBinding: Binding<String> {
-        Binding(
-            get: { vm.deviceManager.manualRsdPort },
-            set: { vm.deviceManager.manualRsdPort = $0 }
-        )
     }
 
     var wirelessModeBinding: Binding<Bool> {
         Binding(
             get: { vm.deviceManager.isWirelessMode },
-            set: { vm.deviceManager.isWirelessMode = $0 }
+            set: { newValue in
+                let manager = vm.deviceManager
+                guard manager.isWirelessMode != newValue else { return }
+                guard !manager.isConnecting else { return }
+
+                if manager.isConnected {
+                    Task {
+                        await manager.disconnectAsync()
+                        DispatchQueue.main.async {
+                            manager.isWirelessMode = newValue
+                            manager.connectDevice()
+                        }
+                    }
+                } else {
+                    manager.isWirelessMode = newValue
+                }
+            }
         )
     }
 
@@ -83,10 +73,6 @@ extension ContentView {
         DeviceStatusSectionView(
             vm: vm,
             isCompactSidebar: isCompactSidebar,
-            isConnectionAdvancedExpanded: $isConnectionAdvancedExpanded,
-            tunnelUDID: tunnelUDIDBinding,
-            manualRsdHost: manualRsdHostBinding,
-            manualRsdPort: manualRsdPortBinding,
             isWirelessMode: wirelessModeBinding
         )
     }
@@ -122,12 +108,15 @@ extension ContentView {
                     sidebarFooter(isCompactSidebar: isCompactSidebar)
                 }
             }
-            .frame(minWidth: 250, idealWidth: 268, maxWidth: 284)
+            .frame(maxWidth: .infinity)
         }
     }
 
     func handleDeviceConnectionChange(isConnected: Bool) {
-        guard isConnected else { return }
+        guard isConnected else {
+            vm.handleDeviceDisconnected()
+            return
+        }
 
         vm.startIfReadyAndConnected()
 
@@ -199,7 +188,6 @@ extension ContentView {
         VStack(alignment: .leading, spacing: isCompactSidebar ? 12 : 20) {
             operationModePicker
             deviceStatusSection(isCompactSidebar: isCompactSidebar)
-            statusView
             pinnedCoordinateSection
             locationInputSection
             purePointControlsSection(isCompactSidebar: isCompactSidebar)

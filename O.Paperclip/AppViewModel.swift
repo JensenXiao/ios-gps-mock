@@ -676,6 +676,13 @@ final class AppViewModel {
         startSimulation()
     }
 
+    func handleDeviceDisconnected() {
+        stopSimulation(keepPinned: false)
+        if appState == .moving || appState == .readyToMove {
+            appState = .readyToMove
+        }
+    }
+
     // MARK: - Scene phase
 
     func handleScenePhaseChange(_ newPhase: ScenePhase) {

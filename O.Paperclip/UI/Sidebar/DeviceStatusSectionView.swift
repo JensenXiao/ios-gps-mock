@@ -3,10 +3,6 @@ import SwiftUI
 struct DeviceStatusSectionView: View {
     @Bindable var vm: AppViewModel
     let isCompactSidebar: Bool
-    @Binding var isConnectionAdvancedExpanded: Bool
-    @Binding var tunnelUDID: String
-    @Binding var manualRsdHost: String
-    @Binding var manualRsdPort: String
     @Binding var isWirelessMode: Bool
 
     var body: some View {
@@ -33,16 +29,25 @@ struct DeviceStatusSectionView: View {
             .cornerRadius(10)
             .shadow(color: ModernTheme.shadow, radius: 8, y: 3)
 
-            Toggle(isOn: $isWirelessMode) {
-                HStack(spacing: 4) {
-                    Image(systemName: isWirelessMode ? "wifi" : "cable.connector")
-                        .font(.caption)
-                    Text(isWirelessMode ? "Wi‑Fi 無線連線" : "USB 有線連線")
-                        .font(.caption)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("連線模式")
+                    .font(.caption)
+                    .foregroundColor(ModernTheme.secondaryLabel)
+
+                Picker("連線模式", selection: $isWirelessMode) {
+                    Label("USB", systemImage: "cable.connector")
+                        .tag(false)
+                    Label("Wi‑Fi", systemImage: "wifi")
+                        .tag(true)
                 }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .disabled(vm.deviceManager.isConnecting)
             }
-            .tint(ModernTheme.accent)
-            .disabled(vm.deviceManager.isConnecting || vm.deviceManager.isConnected)
+            .padding(10)
+            .background(ModernTheme.panelRaised)
+            .cornerRadius(10)
+            .shadow(color: ModernTheme.shadow, radius: 8, y: 3)
 
             if let err = vm.deviceManager.lastError, !err.isEmpty {
                 Text(err)
@@ -57,49 +62,8 @@ struct DeviceStatusSectionView: View {
                     .foregroundColor(.secondary)
             }
 
-            DisclosureGroup(isExpanded: $isConnectionAdvancedExpanded) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("指定裝置 UDID（選填）")
-                        .font(.caption)
-                        .foregroundColor(ModernTheme.secondaryLabel)
-                    TextField("UDID（留空自動偵測）", text: $tunnelUDID)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.caption)
-
-                    Divider()
-
-                    Text("手動 RSD 端點（選填）")
-                        .font(.caption)
-                        .foregroundColor(ModernTheme.secondaryLabel)
-                    HStack(spacing: 6) {
-                        TextField("RSD Host", text: $manualRsdHost)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.caption)
-                        TextField("Port", text: $manualRsdPort)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.caption)
-                            .frame(width: 60)
-                    }
-
-                    Text("只有自動連線失敗時才需要手動設定。可用 pymobiledevice3 remote start-tunnel 取得 RSD。")
-                        .font(.system(size: 9))
-                        .foregroundColor(.secondary)
-                }
-                .padding(.top, 4)
-            } label: {
-                Text("進階連線設定")
-                    .font(.caption)
-                    .foregroundColor(ModernTheme.secondaryLabel)
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("目前進度：\(vm.deviceManager.connectionStage)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-
-                if !vm.deviceManager.debugLog.isEmpty && vm.appState != .moving {
-                    debugLogPanel
-                }
+            if !vm.deviceManager.debugLog.isEmpty && vm.appState != .moving {
+                debugLogPanel
             }
 
         }
@@ -110,8 +74,8 @@ struct DeviceStatusSectionView: View {
 
         return ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(recentLines.enumerated()), id: \.offset) { _, line in
-                    Text(line)
+                ForEach(Array(recentLines.indices), id: \.self) { index in
+                    Text(recentLines[index])
                         .font(.system(size: 10, weight: .regular, design: .monospaced))
                         .foregroundColor(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)

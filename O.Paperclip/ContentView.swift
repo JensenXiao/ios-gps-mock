@@ -24,7 +24,6 @@ struct ContentView: View {
     @State var pendingImportedOverlays: [PurePointOverlay] = []
     @State var pendingImportedOverlayTitles: [String: String] = [:]
     @State var isShowingImportedOverlayNamingSheet: Bool = false
-    @State var isConnectionAdvancedExpanded: Bool = false
     @State var visibleMapRegion: MKCoordinateRegion
     let routeColors: [Color] = [.blue, .purple, .orange, .cyan]
     private let purePointViewportActivationCount = AppConstants.PurePoint.viewportActivationCount
