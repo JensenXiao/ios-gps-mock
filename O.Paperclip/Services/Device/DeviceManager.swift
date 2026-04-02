@@ -1,0 +1,1278 @@
+import Foundation
+import MapKit
+import Combine
+
+
+
+private enum SimulateLocationMode: String {
+    case dvt = "developer dvt"
+    case legacy = "developer"
+
+    func clearArgs(host: String, port: String) -> [String] {
+        switch self {
+        case .dvt:
+            ["developer", "dvt", "simulate-location", "clear", "--rsd", host, port]
+        case .legacy:
+            ["developer", "simulate-location", "clear", "--rsd", host, port]
+        }
+    }
+
+    func setArgs(host: String, port: String, latitude: Double, longitude: Double) -> [String] {
+        let lat = String(format: AppConstants.Formatting.coordinatePrecision, latitude)
+        let lon = String(format: AppConstants.Formatting.coordinatePrecision, longitude)
+        switch self {
+        case .dvt:
+            return ["developer", "dvt", "simulate-location", "set", "--rsd", host, port, "--", lat, lon]
+        case .legacy:
+            return ["developer", "simulate-location", "set", "--rsd", host, port, "--", lat, lon]
+        }
+    }
+}
+
+private enum TunnelTransport: String, CaseIterable {
+    case tcp
+    case quic
+}
+
+private enum TunnelConnectionType: String {
+    case usb
+    case wifi
+}
+
+private final class LockedStringBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var text = ""
+
+    func append(_ chunk: String) {
+        lock.lock()
+        text += chunk
+        lock.unlock()
+    }
+
+    func snapshot() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return text
+    }
+}
+
+private final class LockedProcessOutput: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stdout = Data()
+    private var stderr = Data()
+
+    func append(_ data: Data, toStdErr: Bool) {
+        guard !data.isEmpty else { return }
+        lock.lock()
+        if toStdErr {
+            stderr.append(data)
+        } else {
+            stdout.append(data)
+        }
+        lock.unlock()
+    }
+
+    func strings() -> (stdout: String, stderr: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (
+            String(data: stdout, encoding: .utf8) ?? "",
+            String(data: stderr, encoding: .utf8) ?? ""
+        )
+    }
+}
+
+struct TunnelOutputParser {
+    nonisolated static func endpoint(in text: String) -> (host: String, port: String)? {
+        if let host = firstMatch(text, pattern: "RSD\\s+Address:\\s*([^\\s\\n\\r]+)"),
+           let port = firstMatch(text, pattern: "RSD\\s+Port:\\s*(\\d+)") {
+            return (host.trimmingCharacters(in: .whitespacesAndNewlines), port)
+        }
+
+        if let host = firstMatch(text, pattern: "\"host\"\\s*:\\s*\"([^\"]+)\""),
+           let port = firstMatch(text, pattern: "\"port\"\\s*:\\s*(\\d+)") {
+            return (host.trimmingCharacters(in: .whitespacesAndNewlines), port)
+        }
+
+        let lines = text
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if let pair = lines.compactMap(scriptModeEndpoint(from:)).last {
+            return pair
+        }
+
+        if let host = firstMatch(text, pattern: "--rsd\\s+([^\\s]+)\\s+(\\d+)") {
+            let all = matches(text, pattern: "--rsd\\s+([^\\s]+)\\s+(\\d+)")
+            if let last = all.last, last.count == 2 {
+                return (last[0].trimmingCharacters(in: .whitespacesAndNewlines), last[1])
+            }
+            if let port = firstMatch(text, pattern: "--rsd\\s+[^\\s]+\\s+(\\d+)") {
+                return (host.trimmingCharacters(in: .whitespacesAndNewlines), port)
+            }
+        }
+
+        return nil
+    }
+
+    nonisolated static func immediateFailure(in text: String) -> String? {
+        let lines = text
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let fatalMarkers = [
+            " error ",
+            "error:",
+            "exception",
+            "traceback",
+            "device is not connected",
+            "no device connected",
+            "requires root privileges",
+            "connection refused",
+            "timed out",
+            "timeout"
+        ]
+        return lines.last(where: { line in
+            let lowered = " " + line.lowercased() + " "
+            return fatalMarkers.contains(where: { lowered.contains($0) })
+        })
+    }
+
+    nonisolated private static func scriptModeEndpoint(from line: String) -> (host: String, port: String)? {
+        let parts = line.split(whereSeparator: \.isWhitespace)
+        guard parts.count == 2, let port = Int(parts[1]), port > 0 else { return nil }
+        let host = String(parts[0])
+        guard host == "localhost" || host.contains(".") || host.contains(":") else { return nil }
+        return (host, String(port))
+    }
+
+    nonisolated private static func firstMatch(_ text: String, pattern: String) -> String? {
+        guard let r = try? NSRegularExpression(pattern: pattern, options: []) else { return nil }
+        let ns = text as NSString
+        guard let m = r.firstMatch(in: text, options: [], range: NSRange(location: 0, length: ns.length)) else { return nil }
+        guard m.numberOfRanges >= 2 else { return nil }
+        return ns.substring(with: m.range(at: 1))
+    }
+
+    nonisolated private static func matches(_ text: String, pattern: String) -> [[String]] {
+        guard let r = try? NSRegularExpression(pattern: pattern, options: []) else { return [] }
+        let ns = text as NSString
+        let result = r.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
+        return result.map { m in
+            (1..<m.numberOfRanges).compactMap { idx in
+                let rg = m.range(at: idx)
+                guard rg.location != NSNotFound else { return nil }
+                return ns.substring(with: rg)
+            }
+        }
+    }
+}
+
+final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Sendable {
+    @Published private(set) var connectionState: DeviceConnectionState = .disconnected
+    @Published private(set) var deviceName: String = "未連接"
+    @Published private(set) var lastError: String?
+    @Published var manualRsdHost: String = "" {
+        didSet { UserDefaults.standard.set(manualRsdHost, forKey: Self.manualRsdHostKey) }
+    }
+    @Published var manualRsdPort: String = "" {
+        didSet { UserDefaults.standard.set(manualRsdPort, forKey: Self.manualRsdPortKey) }
+    }
+    @Published var tunnelUDID: String = "" {
+        didSet { UserDefaults.standard.set(tunnelUDID, forKey: Self.tunnelUDIDKey) }
+    }
+
+    @Published var isWirelessMode: Bool = false {
+        didSet { UserDefaults.standard.set(isWirelessMode, forKey: Self.wirelessModeKey) }
+    }
+    @Published private(set) var debugLog: [String] = []
+
+    var isConnected: Bool { connectionState.isConnected }
+    var isConnecting: Bool { connectionState.isBusy }
+    var connectionStage: String { connectionState.statusText }
+
+    private struct Endpoint {
+        let host: String
+        let port: String
+    }
+
+    private struct USBMuxDevice: Decodable {
+        let connectionType: String?
+        let deviceClass: String?
+        let deviceName: String?
+        let identifier: String?
+        let uniqueDeviceID: String?
+        let productType: String?
+
+        enum CodingKeys: String, CodingKey {
+            case connectionType = "ConnectionType"
+            case deviceClass = "DeviceClass"
+            case deviceName = "DeviceName"
+            case identifier = "Identifier"
+            case uniqueDeviceID = "UniqueDeviceID"
+            case productType = "ProductType"
+        }
+    }
+
+    private let sendQueue = DispatchQueue(label: "paperclip.gps.sender", qos: .utility)
+    private let connectionQueue = DispatchQueue(label: "paperclip.connection", qos: .utility)
+    private var isConnectionInFlight = false
+    private let sendQueueSpecificKey = DispatchSpecificKey<String>()
+    private let sendQueueSpecificValue = "paperclip.gps.sender"
+    private var inFlight = false
+    private var pendingCoordinate: CLLocationCoordinate2D?
+    private let dvtStream = DVTLocationStream()
+
+    private var tunnelProcess: Process?
+    private var tunnelOutPipe: Pipe?
+    private var tunnelErrPipe: Pipe?
+    private var rsdEndpoint: Endpoint?
+    private var simulateLocationMode: SimulateLocationMode?
+    private var autoReconnectWorkItem: DispatchWorkItem?
+    private var reconnectAttempt: Int = 0
+    private var userInitiatedDisconnect = false
+    private var expectedDvtStreamExit = false
+    private var sentLocationCount: Int = 0
+    private var activeTunnelConnectionType: TunnelConnectionType?
+    private let privilegedTunnelLog = "/tmp/opaperclip_tunnel.log"
+    private let privilegedTunnelPid = "/tmp/opaperclip_tunnel.pid"
+    private let runtimeLog = DiagnosticsPaths.logFileURL(named: "device-runtime.log").path
+    private let runtimeLogQueue = DispatchQueue(label: "paperclip.runtime.log", qos: .utility)
+    private static let manualRsdHostKey = "paperclip.connection.manualRsdHost"
+    private static let manualRsdPortKey = "paperclip.connection.manualRsdPort"
+    private static let tunnelUDIDKey = "paperclip.connection.tunnelUDID"
+    private static let wirelessModeKey = "paperclip.connection.wirelessMode"
+    private static let logFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_TW")
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
+    init() {
+        sendQueue.setSpecific(key: sendQueueSpecificKey, value: sendQueueSpecificValue)
+        let defaults = UserDefaults.standard
+        manualRsdHost = defaults.string(forKey: Self.manualRsdHostKey) ?? ""
+        manualRsdPort = defaults.string(forKey: Self.manualRsdPortKey) ?? ""
+        tunnelUDID = defaults.string(forKey: Self.tunnelUDIDKey) ?? ""
+        isWirelessMode = defaults.bool(forKey: Self.wirelessModeKey)
+    }
+
+    deinit {
+        cancelAutoReconnect()
+        stopTunnel()
+    }
+
+    func connectDevice() {
+        userInitiatedDisconnect = false
+        connectDeviceInternal(autoTriggered: false, force: true)
+    }
+
+    func connectDeviceAsync() async throws {
+        connectDevice()
+        let timeout = Date().addingTimeInterval(AppConstants.Timeouts.tunnelReady + AppConstants.Timeouts.mountTimeout)
+        while Date() < timeout {
+            if isConnected { return }
+            if connectionState == .failed {
+                throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                    NSLocalizedDescriptionKey: lastError ?? "裝置連線失敗"
+                ])
+            }
+            try await Task.sleep(for: .milliseconds(200))
+        }
+        throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+            NSLocalizedDescriptionKey: "裝置連線逾時"
+        ])
+    }
+
+    private func connectDeviceInternal(autoTriggered: Bool, force: Bool) {
+        guard force || !isConnected else { return }
+        if !autoTriggered {
+            cancelAutoReconnect()
+            appendLog("開始連線 Apple 裝置")
+            setConnectionState(.connecting(step: "初始化"), deviceName: "連線中…", lastError: nil)
+        } else {
+            setConnectionState(.connecting(step: "自動重連中"), deviceName: "重新連線中…", lastError: nil)
+            appendLog("執行自動重連（第 \(reconnectAttempt) 次）")
+        }
+
+        connectionQueue.async {
+            if self.isConnectionInFlight {
+                self.appendLog("已有連線流程進行中，略過重複請求")
+                return
+            }
+            self.isConnectionInFlight = true
+            defer { self.isConnectionInFlight = false }
+
+            do {
+                self.activeTunnelConnectionType = self.isWirelessMode ? .wifi : .usb
+                let cmd = try self.resolveCLI()
+                self.appendLog("CLI: \(cmd.joined(separator: " "))")
+                _ = try self.runWithTimeoutLogged(
+                    cmd + ["version"],
+                    timeout: AppConstants.Timeouts.pymobiledeviceCheck,
+                    step: "檢查 pymobiledevice3"
+                )
+
+                if let manual = self.manualEndpointIfValid() {
+                    self.setStage("使用手動 RSD")
+                    self.rsdEndpoint = manual
+                    try self.verifyRsdEndpoint(using: cmd, ep: manual)
+                } else {
+                    let tunnelUDID = try self.preferredConnectionUDID(using: cmd)
+                    self.setStage("準備建立連線")
+                    do {
+                        try self.startTunnelAndResolveEndpoint(using: cmd, udid: tunnelUDID)
+                    } catch {
+                        let err = error.localizedDescription
+                        if err.localizedCaseInsensitiveContains("requires root privileges") {
+                            self.appendLog("start-tunnel 需要管理員權限，改用提示模式重試")
+                            try self.startTunnelWithAdminPrompt(using: cmd, udid: tunnelUDID)
+                        }
+                        else if self.shouldFallbackToAnyDevice(for: err) {
+                            self.appendLog("指定 UDID 連線失敗，改為自動選擇目前已連線裝置重試")
+                            try self.startTunnelAndResolveEndpoint(using: cmd, udid: nil)
+                        } else if try self.shouldFallbackToUSBTunnel(using: cmd, errorMessage: err) {
+                            self.appendLog("Wi‑Fi tunnel 不支援，改用 USB tunnel 重試")
+                            self.activeTunnelConnectionType = .usb
+                            let usbUDID = try self.preferredTunnelUDID(using: cmd)
+                            self.setStage("切換連線方式")
+                            try self.startTunnelAndResolveEndpoint(using: cmd, udid: usbUDID)
+                        } else {
+                            throw error
+                        }
+                    }
+
+                    guard let ep = self.rsdEndpoint else {
+                        throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                            NSLocalizedDescriptionKey: "無法取得 RSD host/port"
+                        ])
+                    }
+                    try self.verifyRsdEndpoint(using: cmd, ep: ep)
+                }
+                guard let ep = self.rsdEndpoint else {
+                    throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                        NSLocalizedDescriptionKey: "RSD endpoint 在連線完成前遺失，請重試"
+                    ])
+                }
+                let deviceLabel = self.connectedDeviceLabel(using: cmd)
+
+                self.setConnectionState(.connected, deviceName: "\(deviceLabel) (RSD: \(ep.host):\(ep.port))", lastError: nil)
+                DispatchQueue.main.async {
+                    print("✅ Tunnel OK: \(ep.host):\(ep.port)")
+                }
+                self.appendLog("連線完成，模式：\(self.simulateLocationMode?.rawValue ?? "unknown")")
+                self.cancelAutoReconnect()
+                self.reconnectAttempt = 0
+            } catch {
+                self.stopTunnel()
+                let lowered = error.localizedDescription.lowercased()
+                self.setConnectionState(.failed, deviceName: "連線失敗", lastError: error.localizedDescription)
+                DispatchQueue.main.async {
+                    print("❌ connectDevice error: \(error.localizedDescription)")
+                }
+                self.appendLog("連線失敗：\(error.localizedDescription)")
+                if autoTriggered || lowered.contains("bad file descriptor") {
+                    self.scheduleAutoReconnect(reason: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func manualEndpointIfValid() -> Endpoint? {
+        let h = manualRsdHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let p = manualRsdPort.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !h.isEmpty, !p.isEmpty else { return nil }
+        guard Int(p) != nil else { return nil }
+        return Endpoint(host: h, port: p)
+    }
+
+    private func preferredConnectionUDID(using cmd: [String]) throws -> String? {
+        if isWirelessMode {
+            setStage("搜尋可用裝置")
+            let requested = effectiveTunnelUDID
+            if let requested, !requested.isEmpty {
+                appendLog("Wireless Mode：使用指定 UDID 建立 Wi‑Fi tunnel")
+                return requested
+            }
+            if let connectedUDID = try preferredActiveDeviceUDID(using: cmd) {
+                appendLog("Wireless Mode：沿用目前已配對裝置建立 Wi‑Fi tunnel")
+                return connectedUDID
+            }
+            appendLog("Wireless Mode：自動尋找可用的 Wi‑Fi 裝置")
+            return nil
+        }
+        return try preferredTunnelUDID(using: cmd)
+    }
+
+    private func preferredActiveDeviceUDID(using cmd: [String]) throws -> String? {
+        let devices = try listConnectedDevices(using: cmd)
+        guard !devices.isEmpty else { return nil }
+
+        if let requested = effectiveTunnelUDID,
+           let matched = devices.first(where: { matchesDevice($0, requestedUDID: requested) }) {
+            return matched.identifier ?? matched.uniqueDeviceID
+        }
+
+        let preferredDevice =
+            devices.first(where: { ($0.connectionType ?? "").uppercased() == "USB" }) ??
+            devices.first
+
+        return preferredDevice?.identifier ?? preferredDevice?.uniqueDeviceID
+    }
+
+    private func preferredTunnelUDID(using cmd: [String]) throws -> String? {
+        let devices = try listConnectedDevices(using: cmd)
+        guard !devices.isEmpty else {
+            throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "未偵測到已連線的 iPhone/iPad。請確認裝置已用 USB 接上、已解鎖並信任這台 Mac，且 Finder 或 Xcode 能看到裝置；若你已知 RSD，也可在進階連線直接輸入 host/port。"
+            ])
+        }
+
+        appendLog("偵測到裝置：" + devices.map(deviceDebugLabel(for:)).joined(separator: "、"))
+
+        guard let requested = effectiveTunnelUDID else { return nil }
+        if devices.contains(where: { matchesDevice($0, requestedUDID: requested) }) {
+            return requested
+        }
+
+        appendLog("指定 UDID \(requested) 不在目前裝置列表中，改用自動選擇")
+        return nil
+    }
+
+    private func verifyRsdEndpoint(using cmd: [String], ep: Endpoint) throws {
+        setStage("驗證裝置服務")
+        appendLog("RSD endpoint: \(ep.host):\(ep.port)")
+
+        _ = try runWithTimeoutLogged(cmd + [
+            "mounter", "auto-mount",
+            "--rsd", ep.host, ep.port
+        ], timeout: AppConstants.Timeouts.mountTimeout, step: "掛載 Developer Disk Image")
+
+        _ = try runWithTimeoutLogged(cmd + [
+            "remote", "rsd-info",
+            "--rsd", ep.host, ep.port
+        ], timeout: AppConstants.Timeouts.rsdInfo, step: "讀取 RSD 資訊")
+
+        simulateLocationMode = try detectSimulateLocationMode(using: cmd, ep: ep)
+        appendLog("simulate-location 使用：\(simulateLocationMode?.rawValue ?? "unknown")")
+    }
+
+    private func detectSimulateLocationMode(using cmd: [String], ep: Endpoint) throws -> SimulateLocationMode {
+        setStage("偵測 simulate-location 模式")
+        do {
+            _ = try runWithTimeoutLogged(
+                cmd + SimulateLocationMode.dvt.clearArgs(host: ep.host, port: ep.port),
+                timeout: AppConstants.Timeouts.rsdInfo,
+                step: "嘗試 dvt clear"
+            )
+            return .dvt
+        } catch {
+            appendLog("dvt simulate-location 不可用：\(error.localizedDescription)")
+        }
+        _ = try runWithTimeoutLogged(
+            cmd + SimulateLocationMode.legacy.clearArgs(host: ep.host, port: ep.port),
+            timeout: AppConstants.Timeouts.rsdInfo,
+            step: "嘗試 legacy clear"
+        )
+        return .legacy
+    }
+
+    private var effectiveTunnelUDID: String? {
+        let trimmed = tunnelUDID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private var effectiveTunnelConnectionType: TunnelConnectionType {
+        activeTunnelConnectionType ?? (isWirelessMode ? .wifi : .usb)
+    }
+
+    private var preferredConnectionType: String {
+        effectiveTunnelConnectionType.rawValue
+    }
+
+    private func shouldFallbackToUSBTunnel(using cmd: [String], errorMessage: String) throws -> Bool {
+        guard effectiveTunnelConnectionType == .wifi else { return false }
+        let lower = errorMessage.lowercased()
+        guard lower.contains("operation not supported by device")
+            || lower.contains("no route to host")
+            || lower.contains("network is unreachable") else {
+            return false
+        }
+        let devices = try listConnectedDevices(using: cmd)
+        return !devices.isEmpty
+    }
+
+    private func shouldFallbackToAnyDevice(for errorMessage: String) -> Bool {
+        guard effectiveTunnelUDID != nil else { return false }
+        let lower = errorMessage.lowercased()
+        return lower.contains("device is not connected")
+            || lower.contains("no device connected")
+            || lower.contains("usbmux")
+    }
+
+    private func listConnectedDevices(using cmd: [String]) throws -> [USBMuxDevice] {
+        let raw = try runWithTimeoutLogged(
+            cmd + ["usbmux", "list"],
+            timeout: AppConstants.Timeouts.tunnelReady,
+            step: "偵測連線裝置"
+        )
+        guard let data = raw.data(using: .utf8) else { return [] }
+        return (try? JSONDecoder().decode([USBMuxDevice].self, from: data)) ?? []
+    }
+
+    private func matchesDevice(_ device: USBMuxDevice, requestedUDID: String) -> Bool {
+        device.identifier == requestedUDID || device.uniqueDeviceID == requestedUDID
+    }
+
+    private func deviceDebugLabel(for device: USBMuxDevice) -> String {
+        let name = device.deviceName ?? device.productType ?? device.deviceClass ?? "Apple Device"
+        let transport = device.connectionType?.uppercased() ?? "UNKNOWN"
+        let identifier = device.identifier ?? device.uniqueDeviceID ?? "no-id"
+        return "\(name) [\(transport)] \(identifier)"
+    }
+
+    private func resolveConnectedDeviceLabel(using cmd: [String], preferredUDID: String?) throws -> String {
+        let devices = try listConnectedDevices(using: cmd)
+        guard !devices.isEmpty else {
+            return "Apple Device"
+        }
+
+        let preferred = preferredUDID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let picked =
+            devices.first(where: {
+                guard let preferred else { return false }
+                return $0.identifier == preferred || $0.uniqueDeviceID == preferred
+            }) ??
+            devices.first(where: { ($0.connectionType ?? "").uppercased() == "USB" }) ??
+            devices.first
+
+        guard let picked else { return "Apple Device" }
+        let type = picked.productType ?? picked.deviceClass ?? "Apple Device"
+        if let name = picked.deviceName, !name.isEmpty {
+            return "\(name) \(type)"
+        }
+        return type
+    }
+
+    private func connectedDeviceLabel(using cmd: [String]) -> String {
+        if effectiveTunnelConnectionType == .wifi {
+            if let requested = effectiveTunnelUDID {
+                return "Apple Device (Wi‑Fi: \(requested))"
+            }
+            return "Apple Device (Wi‑Fi)"
+        }
+        return (try? resolveConnectedDeviceLabel(using: cmd, preferredUDID: effectiveTunnelUDID)) ?? "Apple Device"
+    }
+
+    private func startTunnelWithAdminPrompt(using cmd: [String], udid: String?) throws {
+        var failures: [String] = []
+        let candidates: [String?] = udid == nil ? [nil] : [udid, nil]
+
+        for candidateUDID in candidates {
+            if udid != nil && candidateUDID == nil {
+                appendLog("改用目前已連線裝置重試管理員 tunnel")
+            }
+            var shouldMoveToNextCandidate = false
+            for transport in TunnelTransport.allCases {
+                do {
+                    try startTunnelWithAdminPrompt(using: cmd, udid: candidateUDID, transport: transport)
+                    return
+                } catch {
+                    let failure = "\(transport.rawValue): \(error.localizedDescription)"
+                    failures.append(failure)
+                    appendLog("管理員 tunnel 失敗（\(failure)）")
+                    stopPrivilegedTunnelProcessIfNeeded()
+                    if candidateUDID != nil && shouldFallbackToAnyDevice(for: error.localizedDescription) {
+                        shouldMoveToNextCandidate = true
+                        break
+                    }
+                }
+            }
+            if shouldMoveToNextCandidate {
+                continue
+            }
+        }
+        throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+            NSLocalizedDescriptionKey: "已要求管理員權限，但所有 tunnel 協定都失敗。\n" + failures.joined(separator: "\n")
+        ])
+    }
+
+    private func startTunnelWithAdminPrompt(using cmd: [String], udid: String?, transport: TunnelTransport) throws {
+        setStage("請求系統授權")
+        let full = cmd + startTunnelArguments(transport: transport, udid: udid)
+        let cmdLine = full.map { shellEscape($0) }.joined(separator: " ")
+
+        let shellCmd =
+            "LOG=\(shellEscape(privilegedTunnelLog)); " +
+            "PIDFILE=\(shellEscape(privilegedTunnelPid)); " +
+            ": > \"$LOG\"; " +
+            "\(cmdLine) >> \"$LOG\" 2>&1 & " +
+            "echo $! > \"$PIDFILE\""
+
+        if runWithNonInteractiveSudo(shellCmd) {
+            appendLog("以 sudo -n 啟動管理員 tunnel")
+        } else {
+            let apple = "do shell script " + "\"" + shellEscapeForAppleScript(shellCmd) + "\" with administrator privileges"
+            _ = try run(["/usr/bin/osascript", "-e", apple])
+            appendLog("以系統授權視窗啟動管理員 tunnel (\(transport.rawValue))")
+        }
+        appendLog("管理員 tunnel 已啟動，等待 RSD 位址 (\(transport.rawValue))")
+
+        let deadline = Date().addingTimeInterval(AppConstants.Timeouts.tunnelReady)
+        while Date() < deadline {
+            if let text = try? String(contentsOfFile: privilegedTunnelLog, encoding: .utf8) {
+                if let pair = TunnelOutputParser.endpoint(in: text) {
+                    rsdEndpoint = Endpoint(host: pair.host, port: pair.port)
+                    let ep = rsdEndpoint!
+                    appendLog("管理員 tunnel RSD：\(ep.host):\(ep.port)")
+                    return
+                }
+                if let failure = TunnelOutputParser.immediateFailure(in: text) {
+                    throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                        NSLocalizedDescriptionKey: failure
+                    ])
+                }
+            }
+            Thread.sleep(forTimeInterval: AppConstants.Timeouts.pollInterval)
+        }
+
+        let logText = (try? String(contentsOfFile: privilegedTunnelLog, encoding: .utf8)) ?? ""
+        throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+            NSLocalizedDescriptionKey: "已要求管理員權限，但仍未拿到 RSD 位址。\n\(logText)"
+        ])
+    }
+
+    private func startTunnelArguments(transport: TunnelTransport, udid: String?) -> [String] {
+        [
+            "remote", "start-tunnel",
+            "--connection-type", preferredConnectionType,
+            "--script-mode",
+            "-p", transport.rawValue
+        ] + (udid.map { ["--udid", $0] } ?? [])
+    }
+
+    private func shellEscape(_ s: String) -> String {
+        if s.isEmpty { return "''" }
+        return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func shellEscapeForAppleScript(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    private func stopPrivilegedTunnelProcessIfNeeded() {
+        if let pidStr = try? String(contentsOfFile: privilegedTunnelPid, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !pidStr.isEmpty {
+            let cmd = "if [ -f \(shellEscape(privilegedTunnelPid)) ]; then kill \(pidStr) >/dev/null 2>&1 || true; rm -f \(shellEscape(privilegedTunnelPid)); fi"
+            if !runWithNonInteractiveSudo(cmd) {
+                let apple = "do shell script " + "\"" + shellEscapeForAppleScript(cmd) + "\" with administrator privileges"
+                _ = try? run(["/usr/bin/osascript", "-e", apple])
+            }
+        }
+    }
+
+    func disconnect() {
+        userInitiatedDisconnect = true
+        cancelAutoReconnect()
+        clearSimulatedLocation()
+        stopTunnel()
+        setConnectionState(.disconnected, deviceName: "未連接", lastError: nil)
+        appendLog("裝置已中斷")
+    }
+
+    func disconnectAsync() async {
+        disconnect()
+        while isConnected || isConnecting {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    func sendLocationToDevice(latitude: Double, longitude: Double) {
+        guard isConnected else { return }
+        let c = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+        guard CLLocationCoordinate2DIsValid(c) else { return }
+
+        sendQueue.async { [weak self] in
+            guard let self else { return }
+            self.pendingCoordinate = c
+            self.flushLatestCoordinate()
+        }
+    }
+
+    func sendLocationToDeviceAsync(latitude: Double, longitude: Double) async throws {
+        guard isConnected else {
+            throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "裝置尚未連線"
+            ])
+        }
+        let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+        guard CLLocationCoordinate2DIsValid(coordinate) else {
+            throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "座標無效"
+            ])
+        }
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            sendQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(throwing: NSError(domain: "DeviceManager", code: -1, userInfo: [
+                        NSLocalizedDescriptionKey: "DeviceManager 已釋放"
+                    ]))
+                    return
+                }
+
+                let wasIdle = !self.inFlight && self.pendingCoordinate == nil
+                self.pendingCoordinate = coordinate
+
+                guard wasIdle else {
+                    continuation.resume()
+                    return
+                }
+
+                self.flushLatestCoordinate()
+                if self.lastError?.contains("發送定位失敗") == true {
+                    continuation.resume(throwing: NSError(domain: "DeviceManager", code: -1, userInfo: [
+                        NSLocalizedDescriptionKey: self.lastError ?? "發送定位失敗"
+                    ]))
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    func startContinuousLocationStream() {
+        guard isConnected else { return }
+        sendQueue.async { [weak self] in
+            guard let self, let ep = self.rsdEndpoint else { return }
+            guard self.simulateLocationMode == .dvt else { return }
+            do {
+                try self.startDvtStreamIfNeeded(host: ep.host, port: ep.port)
+            } catch {
+                self.appendLog("啟動 DVT 即時定位流失敗：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    func stopContinuousLocationStream() {
+        sendQueue.async { [weak self] in
+            self?.dvtStream.stop()
+        }
+    }
+
+    func clearSimulatedLocation() {
+        guard isConnected else { return }
+        sendQueue.async { [weak self] in
+            guard let self, let ep = self.rsdEndpoint else { return }
+            do {
+                let cmd = try self.resolveCLI()
+                let mode = self.simulateLocationMode ?? .legacy
+                self.dvtStream.clear()
+                _ = try self.runWithTimeoutLogged(
+                    cmd + mode.clearArgs(host: ep.host, port: ep.port),
+                    timeout: AppConstants.Timeouts.rsdInfo,
+                    step: "清除模擬定位"
+                )
+                print("🧹 已清除模擬定位")
+            } catch {
+                print("⚠️ 清除失敗: \(error.localizedDescription)")
+                self.appendLog("清除模擬定位失敗：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    func clearSimulatedLocationAsync() async throws {
+        guard isConnected else { return }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            sendQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(throwing: NSError(domain: "DeviceManager", code: -1, userInfo: [
+                        NSLocalizedDescriptionKey: "DeviceManager 已釋放"
+                    ]))
+                    return
+                }
+                guard let ep = self.rsdEndpoint else {
+                    continuation.resume(throwing: NSError(domain: "DeviceManager", code: -1, userInfo: [
+                        NSLocalizedDescriptionKey: "RSD 未就緒"
+                    ]))
+                    return
+                }
+                do {
+                    let cmd = try self.resolveCLI()
+                    let mode = self.simulateLocationMode ?? .legacy
+                    self.dvtStream.clear()
+                    _ = try self.runWithTimeoutLogged(
+                        cmd + mode.clearArgs(host: ep.host, port: ep.port),
+                        timeout: AppConstants.Timeouts.rsdInfo,
+                        step: "清除模擬定位"
+                    )
+                    continuation.resume()
+                } catch {
+                    self.appendLog("清除模擬定位失敗：\(error.localizedDescription)")
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func flushLatestCoordinate() {
+        guard !inFlight, let next = pendingCoordinate else { return }
+        pendingCoordinate = nil
+        inFlight = true
+        defer {
+            inFlight = false
+            if pendingCoordinate != nil { flushLatestCoordinate() }
+        }
+
+        guard rsdEndpoint != nil else {
+            setConnectionState(.failed, deviceName: "RSD 未就緒，請重連", lastError: "RSD 未就緒")
+            return
+        }
+
+        do {
+            let lat = String(format: AppConstants.Formatting.coordinatePrecision, next.latitude)
+            let lon = String(format: AppConstants.Formatting.coordinatePrecision, next.longitude)
+            try sendCoordinate(latitude: next.latitude, longitude: next.longitude)
+            sentLocationCount += 1
+            if sentLocationCount % 100 == 0 {
+                appendLog("定位已送出：\(lat), \(lon)")
+            }
+        } catch {
+            let msg = error.localizedDescription
+            print("❌ 發送失敗: \(msg)")
+            appendLog("送出定位失敗：\(msg)")
+            DispatchQueue.main.async {
+                self.lastError = "發送定位失敗：\(msg)"
+            }
+            if msg.lowercased().contains("timeout") || msg.lowercased().contains("broken pipe") || msg.lowercased().contains("connection") {
+                setConnectionState(.failed, deviceName: "Tunnel 中斷，請重連", lastError: msg)
+                scheduleAutoReconnect(reason: msg)
+            }
+        }
+    }
+
+    private func resolveCLI() throws -> [String] {
+        if let resourcesURL = Bundle.main.resourceURL {
+            let bundledURL = resourcesURL
+                .appendingPathComponent("pymobiledevice3-bundle", isDirectory: true)
+                .appendingPathComponent("pymobiledevice3", isDirectory: false)
+            let bundledPath = bundledURL.path
+            if FileManager.default.isExecutableFile(atPath: bundledPath) {
+            appendLog("CLI source: bundled (\(bundledPath))")
+            return [bundledPath]
+            }
+        }
+        appendLog("CLI source: bundled missing")
+        throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+            NSLocalizedDescriptionKey: "找不到 bundled pymobiledevice3 CLI。請重新安裝 App。"
+        ])
+    }
+
+    private func startTunnelAndResolveEndpoint(using cmd: [String], udid: String?) throws {
+        var failures: [String] = []
+        for transport in TunnelTransport.allCases {
+            do {
+                try startTunnelAndResolveEndpoint(using: cmd, udid: udid, transport: transport)
+                return
+            } catch {
+                let failure = "\(transport.rawValue): \(error.localizedDescription)"
+                failures.append(failure)
+                appendLog("tunnel 失敗（\(failure)）")
+                stopTunnel()
+            }
+        }
+        throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+            NSLocalizedDescriptionKey: "所有 tunnel 協定都失敗。\n" + failures.joined(separator: "\n")
+        ])
+    }
+
+    private func startTunnelAndResolveEndpoint(using cmd: [String], udid: String?, transport: TunnelTransport) throws {
+        stopTunnel()
+        setStage("等待連線就緒")
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = cmd + startTunnelArguments(transport: transport, udid: udid)
+
+        let out = Pipe()
+        let err = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+
+        let textBuffer = LockedStringBuffer()
+        let appendText: @Sendable (String) -> Void = { chunk in
+            textBuffer.append(chunk)
+        }
+        let snapshotText: () -> String = {
+            textBuffer.snapshot()
+        }
+
+        out.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let t = String(data: data, encoding: .utf8) else { return }
+            appendText(t)
+        }
+        err.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let t = String(data: data, encoding: .utf8) else { return }
+            appendText("\n" + t)
+        }
+
+        try p.run()
+
+        p.terminationHandler = { [weak self] proc in
+            guard let self else { return }
+            out.fileHandleForReading.readabilityHandler = nil
+            err.fileHandleForReading.readabilityHandler = nil
+            if self.rsdEndpoint != nil && !self.userInitiatedDisconnect {
+                self.handleUnexpectedConnectionLoss(reason: "tunnel 行程已結束（code: \(proc.terminationStatus)）")
+            }
+        }
+
+        tunnelProcess = p
+        tunnelOutPipe = out
+        tunnelErrPipe = err
+
+        let deadline = Date().addingTimeInterval(AppConstants.Timeouts.tunnelReady)
+        appendLog("等待 tunnel 輸出 RSD 位址 (\(transport.rawValue))")
+
+        while Date() < deadline {
+            let currentText = snapshotText()
+            if let pair = TunnelOutputParser.endpoint(in: currentText) {
+                let ep = Endpoint(host: pair.host, port: pair.port)
+                rsdEndpoint = ep
+                appendLog("抓到 RSD 位址：\(ep.host):\(ep.port)")
+                out.fileHandleForReading.readabilityHandler = nil
+                err.fileHandleForReading.readabilityHandler = nil
+                return
+            }
+
+            if let failure = TunnelOutputParser.immediateFailure(in: currentText) {
+                out.fileHandleForReading.readabilityHandler = nil
+                err.fileHandleForReading.readabilityHandler = nil
+                throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                    NSLocalizedDescriptionKey: failure
+                ])
+            }
+
+            if !p.isRunning {
+                break
+            }
+
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+
+        out.fileHandleForReading.readabilityHandler = nil
+        err.fileHandleForReading.readabilityHandler = nil
+        let finalText = snapshotText()
+        appendLog("tunnel 未返回 RSD 位址 (\(transport.rawValue))")
+
+        throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+            NSLocalizedDescriptionKey: "start-tunnel 逾時或未輸出 RSD 位址。\n\(finalText)"
+        ])
+    }
+
+    private func isOnSendQueue() -> Bool {
+        DispatchQueue.getSpecific(key: sendQueueSpecificKey) == sendQueueSpecificValue
+    }
+
+    private func resetSendState() {
+        expectedDvtStreamExit = true
+        dvtStream.stop()
+        pendingCoordinate = nil
+        inFlight = false
+    }
+
+    private func stopSendPipelineSynchronously() {
+        if isOnSendQueue() {
+            resetSendState()
+            return
+        }
+        let group = DispatchGroup()
+        group.enter()
+        sendQueue.async { [weak self] in
+            defer { group.leave() }
+            self?.resetSendState()
+        }
+        _ = group.wait(timeout: .now() + 2.0)
+    }
+
+    private func stopTunnel() {
+        rsdEndpoint = nil
+        simulateLocationMode = nil
+        activeTunnelConnectionType = nil
+        stopSendPipelineSynchronously()
+
+        if let p = tunnelProcess, p.isRunning {
+            p.terminate()
+            Thread.sleep(forTimeInterval: AppConstants.Timeouts.pollInterval)
+            if p.isRunning { p.interrupt() }
+        }
+
+        tunnelProcess = nil
+        tunnelOutPipe = nil
+        tunnelErrPipe = nil
+
+        stopPrivilegedTunnelProcessIfNeeded()
+
+    }
+
+    private func handleUnexpectedConnectionLoss(reason: String) {
+        guard !userInitiatedDisconnect else { return }
+        guard rsdEndpoint != nil || connectionState.isConnected else { return }
+        appendLog("連線中斷：\(reason)")
+        stopTunnel()
+        setConnectionState(.failed, deviceName: "連線已中斷", lastError: reason)
+        scheduleAutoReconnect(reason: reason)
+    }
+
+    @discardableResult
+    private func runWithNonInteractiveSudo(_ shellCmd: String) -> Bool {
+        do {
+            _ = try run(["/usr/bin/sudo", "-n", "/bin/sh", "-c", shellCmd])
+            return true
+        } catch {
+            appendLog("sudo -n 不可用：\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func scheduleAutoReconnect(reason: String) {
+        guard !userInitiatedDisconnect else { return }
+        guard autoReconnectWorkItem == nil else { return }
+
+        reconnectAttempt += 1
+        let delay = min(AppConstants.DeviceStream.reconnectBackoffCap, pow(2.0, Double(max(0, reconnectAttempt - 1))))
+        setConnectionState(.connecting(step: "等待重連"), deviceName: "等待重新連線…", lastError: lastError)
+        appendLog("排程自動重連（\(String(format: "%.0f", delay))s）原因：\(reason)")
+
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.autoReconnectWorkItem = nil
+            guard !self.userInitiatedDisconnect else { return }
+            self.connectDeviceInternal(autoTriggered: true, force: true)
+        }
+        autoReconnectWorkItem = item
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func cancelAutoReconnect() {
+        autoReconnectWorkItem?.cancel()
+        autoReconnectWorkItem = nil
+    }
+
+    private func setStage(_ stage: String) {
+        setConnectionState(.connecting(step: stage), lastError: nil)
+    }
+
+    private func setConnectionState(
+        _ state: DeviceConnectionState,
+        deviceName: String? = nil,
+        lastError: String? = nil
+    ) {
+        DispatchQueue.main.async {
+            self.connectionState = state
+            if let deviceName {
+                self.deviceName = deviceName
+            }
+            self.lastError = lastError
+        }
+    }
+
+    private func appendLog(_ text: String) {
+        let stamp = Self.logFormatter.string(from: Date())
+        let line = "[\(stamp)] \(text)"
+        DispatchQueue.main.async {
+            self.debugLog.append(line)
+            if self.debugLog.count > 120 {
+                self.debugLog.removeFirst(self.debugLog.count - 120)
+            }
+        }
+        runtimeLogQueue.async { [runtimeLog] in
+            guard let data = (line + "\n").data(using: .utf8) else { return }
+            let fm = FileManager.default
+            if !fm.fileExists(atPath: runtimeLog) {
+                fm.createFile(atPath: runtimeLog, contents: data)
+                return
+            }
+            do {
+                let fh = try FileHandle(forWritingTo: URL(fileURLWithPath: runtimeLog))
+                try fh.seekToEnd()
+                try fh.write(contentsOf: data)
+                try fh.close()
+            } catch {
+                // Avoid recursive logging here.
+            }
+        }
+    }
+
+    private func runWithTimeoutLogged(_ args: [String], timeout: TimeInterval, step: String) throws -> String {
+        appendLog("▶ \(step)")
+        appendLog("cmd: \(args.joined(separator: " "))")
+        do {
+            let out = try runWithTimeout(args, timeout: timeout)
+            let trimmed = summarizeOutput(out)
+            if !trimmed.isEmpty {
+                appendLog("out: \(trimmed)")
+            }
+            appendLog("✓ \(step)")
+            return out
+        } catch {
+            appendLog("✗ \(step): \(error.localizedDescription)")
+            throw error
+        }
+    }
+
+    private func summarizeOutput(_ text: String, maxChars: Int = 260) -> String {
+        let cleaned = text
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: .newlines)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .prefix(3)
+            .joined(separator: " | ")
+        if cleaned.count <= maxChars { return cleaned }
+        return String(cleaned.prefix(maxChars)) + "..."
+    }
+
+    private func sendCoordinateByLegacyCommand(latitude: Double, longitude: Double) throws {
+        guard let ep = rsdEndpoint else {
+            throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "RSD 未就緒"
+            ])
+        }
+        let cmd = try resolveCLI()
+        let mode = simulateLocationMode ?? .legacy
+        _ = try runWithTimeout(
+            cmd + mode.setArgs(host: ep.host, port: ep.port, latitude: latitude, longitude: longitude),
+            timeout: AppConstants.Timeouts.coordinateSend
+        )
+    }
+
+    private func sendCoordinate(latitude: Double, longitude: Double) throws {
+        guard let ep = rsdEndpoint else {
+            throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "RSD 未就緒"
+            ])
+        }
+
+        if simulateLocationMode == .dvt {
+            try startDvtStreamIfNeeded(host: ep.host, port: ep.port)
+            try dvtStream.send(latitude: latitude, longitude: longitude)
+            return
+        }
+
+        try sendCoordinateByLegacyCommand(latitude: latitude, longitude: longitude)
+    }
+
+    private func startDvtStreamIfNeeded(host: String, port: String) throws {
+        if dvtStream.isRunning {
+            return
+        }
+
+        expectedDvtStreamExit = false
+
+        try dvtStream.start(
+            host: host,
+            port: port,
+            onOutput: { [weak self] text in
+                self?.appendLog("dvt-stream: \(self?.summarizeOutput(text, maxChars: 180) ?? text)")
+            },
+            onError: { [weak self] text in
+                self?.appendLog("dvt-stream err: \(self?.summarizeOutput(text, maxChars: 180) ?? text)")
+            },
+            onExit: { [weak self] status in
+                guard let self else { return }
+                self.appendLog("dvt-stream exited: \(status)")
+                if self.expectedDvtStreamExit {
+                    self.expectedDvtStreamExit = false
+                    return
+                }
+                self.handleUnexpectedConnectionLoss(reason: "定位串流已中斷（code: \(status)）")
+            }
+        )
+    }
+
+    private func run(_ args: [String]) throws -> String {
+        try runProcess(args, timeout: nil)
+    }
+
+    private func runWithTimeout(_ args: [String], timeout: TimeInterval) throws -> String {
+        try runProcess(args, timeout: timeout)
+    }
+
+    private func runProcess(_ args: [String], timeout: TimeInterval?) throws -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = args
+        p.standardInput = FileHandle.nullDevice
+
+        let out = Pipe()
+        let err = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+
+        let output = LockedProcessOutput()
+
+        @Sendable func append(_ data: Data, toStdErr: Bool) {
+            output.append(data, toStdErr: toStdErr)
+        }
+
+        out.fileHandleForReading.readabilityHandler = { handle in
+            append(handle.availableData, toStdErr: false)
+        }
+        err.fileHandleForReading.readabilityHandler = { handle in
+            append(handle.availableData, toStdErr: true)
+        }
+
+        try p.run()
+
+        if let timeout {
+            let deadline = Date().addingTimeInterval(timeout)
+            while p.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if p.isRunning {
+                p.terminate()
+                out.fileHandleForReading.readabilityHandler = nil
+                err.fileHandleForReading.readabilityHandler = nil
+                append(out.fileHandleForReading.readDataToEndOfFile(), toStdErr: false)
+                append(err.fileHandleForReading.readDataToEndOfFile(), toStdErr: true)
+                let strings = output.strings()
+                let details = [strings.stderr, strings.stdout]
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .first(where: { !$0.isEmpty }) ?? "無額外輸出"
+                throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                    NSLocalizedDescriptionKey: "command timed out: \(args.joined(separator: " ")) | \(details)"
+                ])
+            }
+        } else {
+            p.waitUntilExit()
+        }
+
+        out.fileHandleForReading.readabilityHandler = nil
+        err.fileHandleForReading.readabilityHandler = nil
+        append(out.fileHandleForReading.readDataToEndOfFile(), toStdErr: false)
+        append(err.fileHandleForReading.readDataToEndOfFile(), toStdErr: true)
+
+        let strings = output.strings()
+        let stdoutString = strings.stdout
+        let stderrString = strings.stderr
+
+        if p.terminationStatus != 0 {
+            let details = [stderrString, stdoutString]
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first(where: { !$0.isEmpty }) ?? "Command failed"
+            throw NSError(domain: "DeviceManager", code: Int(p.terminationStatus), userInfo: [
+                NSLocalizedDescriptionKey: details
+            ])
+        }
+
+        return stdoutString
+    }
+}

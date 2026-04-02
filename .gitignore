@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+xcuserdata/
+
+# Code coverage
+*.profraw
+*.profdata
+
+# PyInstaller specs (build-time only)
+*.spec
+
+# Distribution
+*.dmg
+
+# AI / tooling
+.claude/
+.sisyphus/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

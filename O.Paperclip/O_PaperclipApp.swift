@@ -10,6 +10,10 @@ import SwiftData
 
 @main
 struct O_PaperclipApp: App {
+    init() {
+        AppDiagnostics.shared.setupIfNeeded()
+    }
+
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
             Item.self,
