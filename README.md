@@ -1,8 +1,10 @@
 # O.Paperclip
 
-**ZH-TW:** macOS GPS 定位偽裝工具，透過 USB 或 Wi‑Fi 對 iPhone / iPad 注入模擬座標。  
+**ZH-TW:** 專門為mac使用者開發的macOS GPS 定位偽裝工具，透過 USB 或 Wi‑Fi 對 iPhone / iPad 注入模擬座標。
+可使用於Pikmin bloom、Pokemon GO等遊戲。  
 **EN:** macOS app that spoofs GPS location on iPhone / iPad over USB or Wi‑Fi.
-
+ 
+使用前請注意：iPhone / iPad 需開啟「開發者模式」
 ---
 
 ## 系統需求 / Requirements
