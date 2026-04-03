@@ -5,7 +5,6 @@
  
 **使用前請注意：iPhone / iPad 需開啟「開發者模式」**  
 **如果這個專案對您有幫助，您可以在這裡支持（贊助）它的開發：Ko-fi: https://ko-fi.com/agocia**  
-**If this project helps you, you can support its development here:Ko-fi: https://ko-fi.com/agocia**
 
 ---
 
