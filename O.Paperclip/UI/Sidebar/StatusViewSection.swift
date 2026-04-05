@@ -7,6 +7,11 @@ struct StatusViewSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if vm.hasActiveRouteSnapshot {
+                Text(vm.isActiveSimulationRunning ? "藍線路線同步中" : "藍線路線已固定")
+                    .foregroundColor(ModernTheme.info)
+            }
+
             switch vm.appState {
             case .selectingA:
                 if vm.operationMode == .multiPoint {
@@ -29,15 +34,19 @@ struct StatusViewSection: View {
             case .calculatingRoute:
                 Text("計算路線中...").foregroundColor(ModernTheme.info)
             case .routeSelection:
-                Text("選擇一條路線").foregroundColor(Color(red: 0.5, green: 0.35, blue: 0.7))
+                Text(vm.hasActiveRouteSnapshot ? "選擇黃色草稿路線" : "選擇一條路線")
+                    .foregroundColor(Color(red: 0.76, green: 0.62, blue: 0.15))
                 Picker("選擇路線", selection: $vm.selectedRouteIndex) {
                     ForEach(Array(vm.routes.enumerated()), id: \.offset) { index, route in
                         Text("路線 \(index + 1) (\(String(format: "%.1f", route.distance / 1000)) km)").tag(index)
                     }
                 }
                 .pickerStyle(.radioGroup)
-            case .readyToMove, .moving:
-                Text(vm.appState == .readyToMove ? "準備就緒" : "移動中...").foregroundColor(ModernTheme.info)
+            case .readyToMove:
+                Text(vm.hasActiveRouteSnapshot ? "黃色草稿已完成，可開始新路線" : "準備就緒")
+                    .foregroundColor(vm.hasActiveRouteSnapshot ? .yellow : ModernTheme.info)
+            case .moving:
+                Text("移動中...").foregroundColor(ModernTheme.info)
             }
         }
         .font(.headline)

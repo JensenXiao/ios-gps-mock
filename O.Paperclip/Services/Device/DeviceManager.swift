@@ -762,7 +762,9 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
 
     func stopContinuousLocationStream() {
         sendQueue.async { [weak self] in
-            self?.dvtStream.stop()
+            guard let self else { return }
+            self.expectedDvtStreamExit = true
+            self.dvtStream.stop()
         }
     }
 

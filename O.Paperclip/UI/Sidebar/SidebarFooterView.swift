@@ -3,7 +3,6 @@ import SwiftUI
 struct SidebarFooterView: View {
     @Bindable var vm: AppViewModel
     let isCompactSidebar: Bool
-    let resetButtonTitle: String
 
     var body: some View {
         VStack(spacing: 8) {
@@ -12,9 +11,9 @@ struct SidebarFooterView: View {
                 .frame(maxWidth: .infinity)
                 .contentShape(Rectangle())
 
-            if vm.appState != .selectingA {
+            if vm.shouldShowResetButton {
                 Button(action: vm.resetAll) {
-                    Text(resetButtonTitle)
+                    Text(vm.resetButtonTitle)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6)
                 }

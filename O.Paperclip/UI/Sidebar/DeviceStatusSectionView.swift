@@ -62,7 +62,7 @@ struct DeviceStatusSectionView: View {
                     .foregroundColor(.secondary)
             }
 
-            if !vm.deviceManager.debugLog.isEmpty && vm.appState != .moving {
+            if !vm.deviceManager.debugLog.isEmpty && !vm.isActiveSimulationRunning {
                 debugLogPanel
             }
 
