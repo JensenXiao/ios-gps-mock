@@ -32,6 +32,12 @@ if [[ ! -d "${APP_PATH}" ]]; then
   exit 1
 fi
 
+echo "[INFO] Sanitizing app bundle for distribution..."
+find "${APP_PATH}" -name '.DS_Store' -delete
+xattr -cr "${APP_PATH}" 2>/dev/null || true
+rm -rf "${APP_PATH}/Contents/Resources/.claude"
+rm -f "${APP_PATH}/Contents/Resources/settings.local.json"
+
 echo "[INFO] Preparing DMG staging directory..."
 cp -R "${APP_PATH}" "${STAGING_DIR}/${APP_NAME}.app"
 ln -s /Applications "${STAGING_DIR}/Applications"
