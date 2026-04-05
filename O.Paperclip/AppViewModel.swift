@@ -24,27 +24,35 @@ final class AppViewModel {
     let deviceManager: any DeviceControlling
     let locationSearchService: any LocationSearching
 
-    // MARK: - App state
+    // MARK: - Draft workflow
     var appState: AppState = .selectingA
     var operationMode: OperationMode = .routeAB
-    var activeOperationMode: OperationMode = .routeAB
     var pendingModeSwitch: OperationMode?
 
-    // MARK: - Points
     var pointA: CLLocationCoordinate2D?
     var pointB: CLLocationCoordinate2D?
     var tempCoordinate: CLLocationCoordinate2D?
     var waypoints: [CLLocationCoordinate2D] = []
     var customRoutePolyline: MKPolyline?
+    var routes: [MKRoute] = []
+    var selectedRouteIndex: Int = 0
+    var draftRoutePoints: [CLLocationCoordinate2D] = []
+    var draftCumulativeRouteDistances: [Double] = []
+    var draftTotalRouteDistance: Double = 0.0
 
-    // MARK: - Route / simulation
+    // MARK: - Active route / simulation
+    var activeOperationMode: OperationMode = .routeAB
+    var activeRoutePolyline: MKPolyline?
     var currentPosition: CLLocationCoordinate2D?
     var currentRoutePoints: [CLLocationCoordinate2D] = []
     var cumulativeRouteDistances: [Double] = []
     var traveledDistance: Double = 0.0
     var totalRouteDistance: Double = 0.0
-    var routes: [MKRoute] = []
-    var selectedRouteIndex: Int = 0
+    var activeIsClosedLoop: Bool = false
+    var activeIsEndlessLoop: Bool = false
+    var isActiveSimulationRunning: Bool = false
+    var shouldResumeActiveAfterReconnect: Bool = false
+    var isShowingRouteReplacementConfirmation: Bool = false
 
     // MARK: - Settings
     var speed: Double = AppConstants.Simulation.defaultSpeed
@@ -57,7 +65,7 @@ final class AppViewModel {
     var coordinateInputText: String = ""
     var locationInputError: String?
 
-    // MARK: - Map camera (owned by View, but ViewModel needs to request changes)
+    // MARK: - Map camera
     var requestCameraPosition: ((MapCameraPosition) -> Void)?
 
     // MARK: - Private
@@ -78,14 +86,66 @@ final class AppViewModel {
         currentPosition ?? lastSentPosition
     }
 
-    var modeForRunningState: OperationMode {
-        appState == .moving ? activeOperationMode : operationMode
+    var hasActiveRouteSnapshot: Bool {
+        activeRoutePolyline != nil || (activeOperationMode == .fixedPoint && currentPosition != nil)
+    }
+
+    var hasDraftPreview: Bool {
+        !routes.isEmpty
+            || (customRoutePolyline?.pointCount ?? 0) > 1
+            || draftRoutePoints.count > 1
+    }
+
+    var hasDraftEdits: Bool {
+        appState != .selectingA
+            || pointA != nil
+            || pointB != nil
+            || tempCoordinate != nil
+            || !waypoints.isEmpty
+            || hasDraftPreview
+    }
+
+    var hasReadyDraft: Bool {
+        guard appState == .readyToMove else { return false }
+        switch operationMode {
+        case .fixedPoint:
+            return pointA != nil
+        case .routeAB, .multiPoint:
+            return draftRoutePoints.count > 1
+        }
+    }
+
+    var shouldUseDraftControls: Bool {
+        !hasActiveRouteSnapshot || hasDraftEdits
+    }
+
+    var shouldShowResetButton: Bool {
+        hasActiveRouteSnapshot ? hasDraftEdits : hasDraftEdits
+    }
+
+    var resetButtonTitle: String {
+        if hasActiveRouteSnapshot {
+            return "清除草稿路線"
+        }
+        return operationMode == .fixedPoint ? "清除定位點" : "清除目前路線"
+    }
+
+    var activityNotice: String? {
+        if hasActiveRouteSnapshot && hasDraftEdits {
+            return "目前藍線持續運作中，正在編輯黃線草稿。"
+        }
+        if hasActiveRouteSnapshot && !isActiveSimulationRunning {
+            return "目前藍線已停止移動，但定位仍固定在裝置上。"
+        }
+        return nil
     }
 
     var estimatedTime: String {
         let distance: Double
         if let route = selectedRoute {
             distance = route.distance
+        } else if draftTotalRouteDistance > 0 {
+            distance = draftTotalRouteDistance
         } else if totalRouteDistance > 0 {
             distance = totalRouteDistance
         } else {
@@ -97,14 +157,34 @@ final class AppViewModel {
     }
 
     var buttonTitle: String {
-        if !deviceManager.isConnected && (appState == .readyToMove || appState == .moving) {
+        if !deviceManager.isConnected && (hasReadyDraft || hasActiveRouteSnapshot) {
             return "請先連線裝置"
         }
-        if modeForRunningState == .fixedPoint {
+        if shouldUseDraftControls {
+            if hasActiveRouteSnapshot && hasReadyDraft {
+                return "開始新路線"
+            }
+            return draftButtonTitle
+        }
+        return activeButtonTitle
+    }
+
+    var isMainActionDisabled: Bool {
+        if shouldUseDraftControls {
+            return draftActionDisabled
+        }
+        return activeActionDisabled
+    }
+
+    var isMainActionDestructive: Bool {
+        !shouldUseDraftControls && isActiveSimulationRunning
+    }
+
+    private var draftButtonTitle: String {
+        if operationMode == .fixedPoint {
             switch appState {
             case .selectingA, .confirmingA: return "選擇定位點"
             case .readyToMove: return "開始定位"
-            case .moving: return "停止訂位(回歸裝置定位）"
             default: break
             }
         }
@@ -117,9 +197,42 @@ final class AppViewModel {
         case .confirmingB: return "確認終點 B"
         case .calculatingRoute: return "計算中..."
         case .routeSelection: return "確認使用此路線"
-        case .readyToMove: return "開始同步移動"
+        case .readyToMove: return hasActiveRouteSnapshot ? "開始新路線" : "開始同步移動"
         case .moving: return "停止移動"
         }
+    }
+
+    private var activeButtonTitle: String {
+        if activeOperationMode == .fixedPoint {
+            return isActiveSimulationRunning ? "停止定位(回歸裝置定位）" : "開始定位"
+        }
+        return isActiveSimulationRunning ? "停止移動" : "開始同步移動"
+    }
+
+    private var draftActionDisabled: Bool {
+        if appState == .calculatingRoute {
+            return true
+        }
+        if appState == .selectingB {
+            return true
+        }
+        if operationMode == .multiPoint && appState == .selectingA {
+            return waypoints.count < 2
+        }
+        if operationMode == .fixedPoint && (appState == .selectingA || appState == .confirmingA) {
+            return pointA == nil && tempCoordinate == nil
+        }
+        if appState == .selectingA {
+            return true
+        }
+        if appState == .readyToMove {
+            return !deviceManager.isConnected
+        }
+        return false
+    }
+
+    private var activeActionDisabled: Bool {
+        !deviceManager.isConnected || !hasActiveRouteSnapshot
     }
 
     init(deviceManager: any DeviceControlling, locationSearchService: any LocationSearching) {
@@ -183,7 +296,6 @@ final class AppViewModel {
 
         if operationMode == .fixedPoint {
             pointA = coordinate
-            currentPosition = coordinate
             tempCoordinate = nil
             appState = .readyToMove
             return
@@ -256,59 +368,110 @@ final class AppViewModel {
     // MARK: - Main action
 
     func handleMainAction() {
+        if shouldUseDraftControls {
+            handleDraftMainAction()
+            return
+        }
+        handleActiveMainAction()
+    }
+
+    func confirmRouteReplacement() {
+        isShowingRouteReplacementConfirmation = false
+        guard deviceManager.isConnected else { return }
+        stopSimulation(keepPinned: false)
+        activateDraftForActiveSession()
+        startSimulation()
+    }
+
+    func cancelRouteReplacement() {
+        isShowingRouteReplacementConfirmation = false
+    }
+
+    func resetAll() {
+        if hasActiveRouteSnapshot {
+            clearDraftWorkflow()
+            return
+        }
+        clearDraftWorkflow()
+        stopSimulation(keepPinned: false)
+        clearSimulatedLocationAsync()
+        clearActiveSnapshot(clearPosition: true)
+    }
+
+    private func handleDraftMainAction() {
         if operationMode == .multiPoint && appState == .selectingA {
             calculateMultiPointRoute()
             return
         }
+
         switch appState {
         case .confirmingA, .confirmingB:
             confirmTempCoordinate()
         case .routeSelection:
-            appState = .readyToMove
             extractRoutePoints()
         case .readyToMove:
             guard deviceManager.isConnected else { return }
-            activeOperationMode = operationMode
-            appState = .moving
-            startSimulation()
-        case .moving:
-            appState = .readyToMove
-            if activeOperationMode == .fixedPoint {
-                stopSimulation(keepPinned: false)
-                clearSimulatedLocationAsync()
+            if hasActiveRouteSnapshot {
+                isShowingRouteReplacementConfirmation = true
             } else {
-                stopSimulation(keepPinned: true)
+                activateDraftForActiveSession()
+                startSimulation()
             }
-            applyPendingModeSwitchIfNeeded()
+        case .moving:
+            break
         default:
             break
         }
     }
 
-    func resetAll() {
-        let shouldClearPinnedLocation = operationMode == .fixedPoint || activeOperationMode == .fixedPoint
-        let preserved = shouldClearPinnedLocation ? nil : pinnedCoordinate
-        stopSimulation(keepPinned: preserved != nil)
-        if shouldClearPinnedLocation {
-            clearSimulatedLocationAsync()
+    private func handleActiveMainAction() {
+        guard hasActiveRouteSnapshot else { return }
+        guard deviceManager.isConnected else { return }
+
+        if activeOperationMode == .fixedPoint {
+            if isActiveSimulationRunning {
+                stopSimulation(keepPinned: false)
+                clearSimulatedLocationAsync()
+                clearActiveSnapshot(clearPosition: true)
+            } else {
+                startSimulation()
+            }
+            return
         }
-        appState = .selectingA
-        pointA = nil
-        pointB = nil
-        tempCoordinate = nil
-        waypoints = []
-        customRoutePolyline = nil
-        currentPosition = preserved
-        routes = []
-        currentRoutePoints = []
-        cumulativeRouteDistances = []
-        traveledDistance = 0.0
-        totalRouteDistance = 0.0
-        restorePinnedLocationIfNeeded(preserved)
-        if operationMode == .fixedPoint, let preserved {
-            pointA = preserved
-            appState = .readyToMove
+
+        if isActiveSimulationRunning {
+            stopSimulation(keepPinned: true)
+        } else {
+            startSimulation()
         }
+    }
+
+    private func activateDraftForActiveSession() {
+        activeOperationMode = operationMode
+        activeIsClosedLoop = isClosedLoop
+        activeIsEndlessLoop = isEndlessLoop
+        shouldResumeActiveAfterReconnect = false
+
+        switch operationMode {
+        case .fixedPoint:
+            guard let fixed = pointA else { return }
+            currentPosition = fixed
+            currentRoutePoints = []
+            cumulativeRouteDistances = []
+            traveledDistance = 0
+            totalRouteDistance = 0
+            activeRoutePolyline = nil
+        case .routeAB, .multiPoint:
+            guard draftRoutePoints.count > 1 else { return }
+            currentRoutePoints = draftRoutePoints
+            cumulativeRouteDistances = draftCumulativeRouteDistances
+            traveledDistance = 0
+            totalRouteDistance = draftTotalRouteDistance
+            currentPosition = draftRoutePoints.first
+            activeRoutePolyline = makeDraftPolyline()
+        }
+
+        clearDraftWorkflow()
     }
 
     // MARK: - Coordinate helpers
@@ -320,7 +483,6 @@ final class AppViewModel {
             pointA = temp
             tempCoordinate = nil
             if operationMode == .fixedPoint {
-                currentPosition = pointA
                 appState = .readyToMove
             } else {
                 appState = .selectingB
@@ -348,6 +510,7 @@ final class AppViewModel {
 
     func calculateRoutes() {
         guard operationMode == .routeAB, let a = pointA, let b = pointB else { return }
+        clearDraftGeometry()
         let request = MKDirections.Request()
         request.source = MKMapItem(location: CLLocation(latitude: a.latitude, longitude: a.longitude), address: nil)
         request.destination = MKMapItem(location: CLLocation(latitude: b.latitude, longitude: b.longitude), address: nil)
@@ -371,31 +534,25 @@ final class AppViewModel {
 
     func extractRoutePoints() {
         guard operationMode == .routeAB, let route = selectedRoute else { return }
-        totalRouteDistance = route.distance
         let pointCount = route.polyline.pointCount
         guard pointCount > 1 else {
-            currentRoutePoints = []
-            cumulativeRouteDistances = []
-            totalRouteDistance = 0
-            currentPosition = nil
+            clearDraftGeometry()
             appState = .routeSelection
             locationInputError = "取得的路線點不足，請改選其他路線"
             return
         }
         var coords = [CLLocationCoordinate2D](repeating: kCLLocationCoordinate2DInvalid, count: pointCount)
         route.polyline.getCoordinates(&coords, range: NSRange(location: 0, length: pointCount))
-        currentRoutePoints = normalizeRoutePoints(coords)
-        guard currentRoutePoints.count > 1 else {
-            cumulativeRouteDistances = []
-            totalRouteDistance = 0
-            currentPosition = nil
+        draftRoutePoints = normalizeRoutePoints(coords)
+        guard draftRoutePoints.count > 1 else {
+            clearDraftGeometry()
             appState = .routeSelection
             locationInputError = "路線資料異常，請改選其他路線"
             return
         }
-        cumulativeRouteDistances = RouteMotionEngine.cumulativeDistances(for: currentRoutePoints)
-        traveledDistance = 0.0
-        if let first = currentRoutePoints.first { currentPosition = first }
+        draftCumulativeRouteDistances = RouteMotionEngine.cumulativeDistances(for: draftRoutePoints)
+        draftTotalRouteDistance = route.distance
+        appState = .readyToMove
     }
 
     func calculateMultiPointRoute() {
@@ -403,6 +560,7 @@ final class AppViewModel {
         appState = .calculatingRoute
         routes = []
         selectedRouteIndex = 0
+        clearDraftGeometry()
 
         let routeWaypoints: [CLLocationCoordinate2D]
         if isClosedLoop, let first = waypoints.first {
@@ -417,21 +575,14 @@ final class AppViewModel {
             if index >= routeWaypoints.count - 1 {
                 let normalized = self.normalizeRoutePoints(accumulator.combinedPoints)
                 guard normalized.count > 1 else {
-                    self.currentRoutePoints = []
-                    self.cumulativeRouteDistances = []
-                    self.totalRouteDistance = 0
-                    self.traveledDistance = 0
-                    self.currentPosition = nil
-                    self.customRoutePolyline = nil
+                    self.clearDraftGeometry()
                     self.locationInputError = "多點路線無效，請重新選點"
                     self.appState = .selectingA
                     return
                 }
-                self.currentRoutePoints = normalized
-                self.cumulativeRouteDistances = RouteMotionEngine.cumulativeDistances(for: normalized)
-                self.totalRouteDistance = accumulator.totalDistance
-                self.traveledDistance = 0
-                self.currentPosition = normalized.first
+                self.draftRoutePoints = normalized
+                self.draftCumulativeRouteDistances = RouteMotionEngine.cumulativeDistances(for: normalized)
+                self.draftTotalRouteDistance = accumulator.totalDistance
                 var coords = normalized
                 self.customRoutePolyline = MKPolyline(coordinates: &coords, count: coords.count)
                 self.appState = .readyToMove
@@ -486,13 +637,22 @@ final class AppViewModel {
 
     func startSimulation() {
         stopPinnedLocationKeepAlive()
+        isActiveSimulationRunning = true
+        shouldResumeActiveAfterReconnect = false
+
         if activeOperationMode == .fixedPoint {
-            guard let fixed = pointA else { return }
-            currentPosition = fixed
+            guard let fixed = currentPosition else {
+                isActiveSimulationRunning = false
+                return
+            }
             startStreamingAndSend(fixed)
             return
         }
-        guard currentRoutePoints.count > 1 else { return }
+
+        guard currentRoutePoints.count > 1 else {
+            isActiveSimulationRunning = false
+            return
+        }
 
         if currentPosition == nil, let first = currentRoutePoints.first {
             currentPosition = first
@@ -502,9 +662,9 @@ final class AppViewModel {
         }
 
         let loopMode: RouteMotionEngine.LoopMode
-        if activeOperationMode == .multiPoint && isClosedLoop {
+        if activeOperationMode == .multiPoint && activeIsClosedLoop {
             loopMode = .circular
-        } else if isEndlessLoop {
+        } else if activeIsEndlessLoop {
             loopMode = .pingPong
         } else {
             loopMode = .singlePass
@@ -522,13 +682,11 @@ final class AppViewModel {
                     routeDistance: self.totalRouteDistance,
                     loopMode: loopMode
                 ) else {
-                    self.stopSimulation()
-                    self.appState = .readyToMove
+                    self.stopSimulation(keepPinned: true)
                     self.currentPosition = self.currentRoutePoints.last
                     if let last = self.currentPosition {
                         self.sendCoordinateAsync(last)
                     }
-                    self.applyPendingModeSwitchIfNeeded()
                     return
                 }
 
@@ -554,6 +712,7 @@ final class AppViewModel {
     func stopSimulation(keepPinned: Bool = true) {
         moveTimer?.invalidate()
         moveTimer = nil
+        isActiveSimulationRunning = false
         lastSentPosition = nil
         lastSentAt = nil
         if keepPinned, let current = currentPosition {
@@ -569,7 +728,7 @@ final class AppViewModel {
         pinnedKeepAliveTimer?.invalidate()
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, self.appState != .moving, let current = self.currentPosition else { return }
+                guard let self, !self.isActiveSimulationRunning, let current = self.currentPosition else { return }
                 self.startStreamingAndSend(current, updateLastSent: false)
             }
         }
@@ -583,7 +742,7 @@ final class AppViewModel {
     }
 
     func restorePinnedLocationIfNeeded(_ coordinate: CLLocationCoordinate2D?) {
-        guard appState != .moving, let coordinate else { return }
+        guard !isActiveSimulationRunning, let coordinate else { return }
         currentPosition = coordinate
         startStreamingAndSend(coordinate)
         startPinnedLocationKeepAlive()
@@ -620,67 +779,91 @@ final class AppViewModel {
         return a.distance(from: b) >= AppConstants.Simulation.minimumDistance
     }
 
-    // MARK: - Mode switching
+    // MARK: - Draft / active state
 
     func switchModePreservingPinnedLocation() {
-        let preserved = pinnedCoordinate
-        stopSimulation(keepPinned: preserved != nil)
-        activeOperationMode = operationMode
-        appState = .selectingA
-        pointA = nil
-        pointB = nil
-        tempCoordinate = nil
-        waypoints = []
-        routes = []
-        selectedRouteIndex = 0
-        customRoutePolyline = nil
-        currentRoutePoints = []
-        cumulativeRouteDistances = []
-        traveledDistance = 0
-        totalRouteDistance = 0
-        currentPosition = preserved
-        restorePinnedLocationIfNeeded(preserved)
-        if operationMode == .fixedPoint, let pinned = preserved {
-            pointA = pinned
-            appState = .readyToMove
-        }
+        clearDraftWorkflow()
     }
 
     func applyPendingModeSwitchIfNeeded() {
         guard let pending = pendingModeSwitch else { return }
         pendingModeSwitch = nil
         operationMode = pending
-        switchModePreservingPinnedLocation()
+        clearDraftWorkflow()
     }
 
     func resetWorkflowForMode() {
-        stopSimulation(keepPinned: true)
+        clearDraftWorkflow()
+    }
+
+    func startIfReadyAndConnected() {
+        guard deviceManager.isConnected else { return }
+
+        if hasActiveRouteSnapshot {
+            if shouldResumeActiveAfterReconnect {
+                shouldResumeActiveAfterReconnect = false
+                startSimulation()
+            } else if let current = currentPosition {
+                startStreamingAndSend(current)
+                startPinnedLocationKeepAlive()
+            }
+            return
+        }
+
+        guard hasReadyDraft else { return }
+        activateDraftForActiveSession()
+        startSimulation()
+    }
+
+    func handleDeviceDisconnected() {
+        shouldResumeActiveAfterReconnect = isActiveSimulationRunning
+        stopSimulation(keepPinned: false)
+    }
+
+    private func clearDraftWorkflow() {
         appState = .selectingA
         pointA = nil
         pointB = nil
         tempCoordinate = nil
         waypoints = []
+        clearDraftGeometry()
+        locationInputError = nil
+    }
+
+    private func clearDraftGeometry() {
         routes = []
         selectedRouteIndex = 0
         customRoutePolyline = nil
+        draftRoutePoints = []
+        draftCumulativeRouteDistances = []
+        draftTotalRouteDistance = 0
+    }
+
+    private func clearActiveSnapshot(clearPosition: Bool) {
+        activeRoutePolyline = nil
         currentRoutePoints = []
         cumulativeRouteDistances = []
         traveledDistance = 0
         totalRouteDistance = 0
-    }
-
-    func startIfReadyAndConnected() {
-        guard deviceManager.isConnected, appState == .readyToMove else { return }
-        activeOperationMode = operationMode
-        appState = .moving
-        startSimulation()
-    }
-
-    func handleDeviceDisconnected() {
-        stopSimulation(keepPinned: false)
-        if appState == .moving || appState == .readyToMove {
-            appState = .readyToMove
+        activeIsClosedLoop = false
+        activeIsEndlessLoop = false
+        isActiveSimulationRunning = false
+        shouldResumeActiveAfterReconnect = false
+        if clearPosition {
+            currentPosition = nil
         }
+    }
+
+    private func makeDraftPolyline() -> MKPolyline? {
+        if let route = selectedRoute {
+            return route.polyline
+        }
+        if let custom = customRoutePolyline, custom.pointCount > 1 {
+            return custom
+        }
+        guard draftRoutePoints.count > 1 else { return nil }
+        var coords = draftRoutePoints
+        return MKPolyline(coordinates: &coords, count: coords.count)
     }
 
     // MARK: - Scene phase
@@ -688,11 +871,11 @@ final class AppViewModel {
     func handleScenePhaseChange(_ newPhase: ScenePhase) {
         switch newPhase {
         case .active:
-            if appState != .moving, currentPosition != nil {
+            if !isActiveSimulationRunning, currentPosition != nil {
                 startPinnedLocationKeepAlive()
             }
         case .inactive, .background:
-            if appState != .moving {
+            if !isActiveSimulationRunning {
                 stopPinnedLocationKeepAlive()
             }
         @unknown default:
@@ -768,8 +951,10 @@ final class AppViewModel {
         var minLat = first.latitude, maxLat = first.latitude
         var minLon = first.longitude, maxLon = first.longitude
         for c in valid.dropFirst() {
-            minLat = min(minLat, c.latitude); maxLat = max(maxLat, c.latitude)
-            minLon = min(minLon, c.longitude); maxLon = max(maxLon, c.longitude)
+            minLat = min(minLat, c.latitude)
+            maxLat = max(maxLat, c.latitude)
+            minLon = min(minLon, c.longitude)
+            maxLon = max(maxLon, c.longitude)
         }
         return normalizeMapRegion(MKCoordinateRegion(
             center: CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2, longitude: (minLon + maxLon) / 2),

@@ -102,6 +102,7 @@ final class DVTLocationStream: DVTStreaming, @unchecked Sendable {
         try? writeCommand("QUIT\n", required: false)
 
         if let p = process, p.isRunning {
+            p.terminationHandler = nil
             p.terminate()
             Thread.sleep(forTimeInterval: AppConstants.Timeouts.dvtStreamStop)
             if p.isRunning { p.interrupt() }

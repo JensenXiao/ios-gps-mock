@@ -90,6 +90,15 @@ extension ContentView {
             .font(.caption)
             .foregroundColor(.secondary)
         }
+        if let notice = vm.activityNotice {
+            Text(notice)
+                .font(.caption)
+                .foregroundColor(.yellow)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.yellow.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
     }
 
     func sidebarPane(isCompactSidebar: Bool) -> some View {
@@ -120,7 +129,6 @@ extension ContentView {
 
         vm.startIfReadyAndConnected()
 
-        guard vm.appState == .moving || vm.appState == .readyToMove else { return }
         guard let current = vm.currentPosition else { return }
         vm.deviceManager.startContinuousLocationStream()
         Task {
@@ -129,10 +137,6 @@ extension ContentView {
     }
 
     func handleOperationModeChange() {
-        if vm.appState == .moving {
-            vm.pendingModeSwitch = vm.operationMode
-            return
-        }
         vm.switchModePreservingPinnedLocation()
     }
 
@@ -189,6 +193,7 @@ extension ContentView {
             operationModePicker
             deviceStatusSection(isCompactSidebar: isCompactSidebar)
             pinnedCoordinateSection
+            StatusViewSection(vm: vm, routeColors: routeColors)
             locationInputSection
             purePointControlsSection(isCompactSidebar: isCompactSidebar)
             Divider()
@@ -204,8 +209,7 @@ extension ContentView {
     func sidebarFooter(isCompactSidebar: Bool) -> some View {
         SidebarFooterView(
             vm: vm,
-            isCompactSidebar: isCompactSidebar,
-            resetButtonTitle: resetButtonTitle
+            isCompactSidebar: isCompactSidebar
         )
     }
 
@@ -247,7 +251,39 @@ extension ContentView {
         )
     }
 
-    var resetButtonTitle: String {
-        vm.operationMode == .fixedPoint ? "清除定位點" : "清除目前路線"
+    var routeReplacementSheetBinding: Binding<Bool> {
+        Binding(
+            get: { vm.isShowingRouteReplacementConfirmation },
+            set: { newValue in
+                vm.isShowingRouteReplacementConfirmation = newValue
+            }
+        )
+    }
+
+    var routeReplacementSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("開始新路線")
+                .font(.title3)
+                .fontWeight(.semibold)
+
+            Text("將以新路線取代目前藍線路線，但不會中斷裝置連線。")
+                .foregroundColor(.secondary)
+
+            HStack(spacing: 10) {
+                Spacer()
+                Button("取消") {
+                    vm.cancelRouteReplacement()
+                }
+                .buttonStyle(.bordered)
+
+                Button("確認開始") {
+                    vm.confirmRouteReplacement()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(ModernTheme.accent)
+            }
+        }
+        .padding(24)
+        .frame(width: 420)
     }
 }

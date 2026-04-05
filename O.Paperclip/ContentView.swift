@@ -25,7 +25,7 @@ struct ContentView: View {
     @State var pendingImportedOverlayTitles: [String: String] = [:]
     @State var isShowingImportedOverlayNamingSheet: Bool = false
     @State var visibleMapRegion: MKCoordinateRegion
-    let routeColors: [Color] = [.blue, .purple, .orange, .cyan]
+    let routeColors: [Color] = [.yellow, .orange, .mint, .pink]
     private let purePointViewportActivationCount = AppConstants.PurePoint.viewportActivationCount
     private let purePointRenderedLimit = AppConstants.PurePoint.renderedLimit
     private let purePointViewportPadding = AppConstants.PurePoint.viewportPadding
@@ -139,6 +139,9 @@ struct ContentView: View {
         .sheet(isPresented: $isShowingImportedOverlayNamingSheet) {
             importedOverlayNamingSheet
         }
+        .sheet(isPresented: routeReplacementSheetBinding) {
+            routeReplacementSheet
+        }
         .onDisappear {
             vm.cleanup()
         }
@@ -185,13 +188,13 @@ struct ContentView: View {
 
                         if vm.operationMode == .multiPoint {
                             ForEach(Array(vm.waypoints.enumerated()), id: \.offset) { idx, point in
-                                Marker("P\(idx + 1)", coordinate: point).tint(.orange)
+                                Marker("P\(idx + 1)", coordinate: point).tint(.yellow)
                             }
                         } else {
                             if let a = vm.pointA {
-                                Marker(vm.operationMode == .fixedPoint ? "定點" : "起點 A", coordinate: a).tint(.green)
+                                Marker(vm.operationMode == .fixedPoint ? "草稿定點" : "草稿起點 A", coordinate: a).tint(.yellow)
                             }
-                            if let b = vm.pointB { Marker("終點 B", coordinate: b).tint(.red) }
+                            if let b = vm.pointB { Marker("草稿終點 B", coordinate: b).tint(.orange) }
                             if let temp = vm.tempCoordinate {
                                 Annotation("確認位置", coordinate: temp, anchor: .bottom) {
                                     VStack(spacing: 6) {
@@ -218,6 +221,11 @@ struct ContentView: View {
                             }
                         }
 
+                        if let active = vm.activeRoutePolyline, active.pointCount > 1 {
+                            MapPolyline(active)
+                                .stroke(Color(red: 0.08, green: 0.24, blue: 0.62), lineWidth: 5)
+                        }
+
                         if !vm.routes.isEmpty {
                             if vm.appState == .routeSelection {
                                 ForEach(Array(vm.routes.enumerated()), id: \.offset) { index, route in
@@ -228,10 +236,10 @@ struct ContentView: View {
                                         )
                                 }
                             } else if let route = vm.selectedRoute {
-                                MapPolyline(route.polyline).stroke(Color(red: 0.08, green: 0.24, blue: 0.62), lineWidth: 5)
+                                MapPolyline(route.polyline).stroke(Color.yellow, lineWidth: 5)
                             }
                         } else if let custom = vm.customRoutePolyline, custom.pointCount > 1 {
-                            MapPolyline(custom).stroke(Color(red: 0.08, green: 0.24, blue: 0.62), lineWidth: 5)
+                            MapPolyline(custom).stroke(Color.yellow, lineWidth: 5)
                         }
 
                         if let current = vm.currentPosition {
