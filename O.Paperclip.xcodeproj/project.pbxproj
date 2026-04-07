@@ -52,6 +52,9 @@
 			exceptions = (
 				CA9AF8702F5539E400AC05E8 /* Exceptions for "O.Paperclip" folder in "O.Paperclip" target */,
 			);
+			explicitFolders = (
+				"Core 2",
+			);
 			path = O.Paperclip;
 			sourceTree = "<group>";
 		};
