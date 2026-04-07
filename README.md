@@ -13,7 +13,7 @@
 
 | Item | Requirement |
 |------|-------------|
-| macOS | macOS 13 Ventura or later |
+| macOS | macOS 14 Sonoma or later |
 | iPhone / iPad | iOS 16 or later, with Developer Mode enabled |
 | Connection | USB or Wi-Fi (same network) |
 | Other | No need to install Python, Homebrew, or any extra packages |
@@ -35,6 +35,24 @@ git clone https://github.com/agocia/O.Paperclip.git
 cd O.Paperclip
 xcodebuild -project O.Paperclip.xcodeproj -scheme O.Paperclip -configuration Release build
 ```
+
+#### Open the app after building
+
+The command above builds `O.Paperclip.app` into Xcode's `DerivedData` (not into the repository root).
+
+```bash
+APP_PATH="$(find ~/Library/Developer/Xcode/DerivedData -path "*/Build/Products/Release/O.Paperclip.app" -print -quit)"
+open "$APP_PATH"
+```
+
+If you want a fixed output path, use this instead:
+
+```bash
+xcodebuild -project O.Paperclip.xcodeproj -scheme O.Paperclip -configuration Release -derivedDataPath build build
+open build/Build/Products/Release/O.Paperclip.app
+```
+
+> First launch may still be blocked by Gatekeeper. If so, right-click `O.Paperclip.app` → `Open` → confirm.
 
 ---
 
