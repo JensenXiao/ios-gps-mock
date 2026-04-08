@@ -1,4 +1,4 @@
-# O.Paperclip
+# ios-gps-mock
 
 **專門為mac使用者開發的macOS GPS 定位偽裝工具，透過 USB 或 Wi‑Fi 對 iPhone / iPad 注入模擬座標。**  
 **MacOS app that spoofs GPS location on iPhone / iPad over USB or Wi‑Fi.**
