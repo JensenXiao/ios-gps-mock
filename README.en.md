@@ -1,4 +1,4 @@
-# O.Paperclip
+# ios-gps-mock
 
 **A macOS GPS spoofing tool built specifically for Mac users, allowing you to inject simulated coordinates into an iPhone or iPad over USB or Wi-Fi.**
 
