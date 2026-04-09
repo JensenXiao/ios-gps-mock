@@ -206,6 +206,7 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         let identifier: String?
         let uniqueDeviceID: String?
         let productType: String?
+        let productVersion: String?
 
         enum CodingKeys: String, CodingKey {
             case connectionType = "ConnectionType"
@@ -214,6 +215,7 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
             case identifier = "Identifier"
             case uniqueDeviceID = "UniqueDeviceID"
             case productType = "ProductType"
+            case productVersion = "ProductVersion"
         }
     }
 
@@ -230,6 +232,7 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
     private var tunnelOutPipe: Pipe?
     private var tunnelErrPipe: Pipe?
     private var rsdEndpoint: Endpoint?
+    private var directDeviceUDID: String?
     private var simulateLocationMode: SimulateLocationMode?
     private var autoReconnectWorkItem: DispatchWorkItem?
     private var reconnectAttempt: Int = 0
@@ -320,49 +323,61 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
                 if let manual = self.manualEndpointIfValid() {
                     self.setStage("使用手動 RSD")
                     self.rsdEndpoint = manual
+                    self.directDeviceUDID = nil
                     try self.verifyRsdEndpoint(using: cmd, ep: manual)
                 } else {
-                    let tunnelUDID = try self.preferredConnectionUDID(using: cmd)
-                    self.setStage("準備建立連線")
-                    do {
-                        try self.startTunnelAndResolveEndpoint(using: cmd, udid: tunnelUDID)
-                    } catch {
-                        let err = error.localizedDescription
-                        if err.localizedCaseInsensitiveContains("requires root privileges") {
-                            self.appendLog("start-tunnel 需要管理員權限，改用提示模式重試")
-                            try self.startTunnelWithAdminPrompt(using: cmd, udid: tunnelUDID)
+                    let preferredDevice = try self.preferredConnectedDevice(using: cmd)
+                    if self.shouldUseDirectUSBConnection(for: preferredDevice) {
+                        self.activeTunnelConnectionType = .usb
+                        try self.connectLegacyDevice(using: cmd, device: preferredDevice)
+                    } else {
+                        let tunnelUDID = try self.preferredConnectionUDID(using: cmd)
+                        self.setStage("準備建立連線")
+                        do {
+                            try self.startTunnelAndResolveEndpoint(using: cmd, udid: tunnelUDID)
+                        } catch {
+                            let err = error.localizedDescription
+                            if err.localizedCaseInsensitiveContains("requires root privileges") {
+                                self.appendLog("start-tunnel 需要管理員權限，改用提示模式重試")
+                                try self.startTunnelWithAdminPrompt(using: cmd, udid: tunnelUDID)
+                            }
+                            else if self.shouldFallbackToAnyDevice(for: err) {
+                                self.appendLog("指定 UDID 連線失敗，改為自動選擇目前已連線裝置重試")
+                                try self.startTunnelAndResolveEndpoint(using: cmd, udid: nil)
+                            } else if try self.shouldFallbackToUSBTunnel(using: cmd, errorMessage: err) {
+                                self.appendLog("Wi‑Fi tunnel 不支援，改用 USB tunnel 重試")
+                                self.activeTunnelConnectionType = .usb
+                                let usbUDID = try self.preferredTunnelUDID(using: cmd)
+                                self.setStage("切換連線方式")
+                                try self.startTunnelAndResolveEndpoint(using: cmd, udid: usbUDID)
+                            } else {
+                                throw error
+                            }
                         }
-                        else if self.shouldFallbackToAnyDevice(for: err) {
-                            self.appendLog("指定 UDID 連線失敗，改為自動選擇目前已連線裝置重試")
-                            try self.startTunnelAndResolveEndpoint(using: cmd, udid: nil)
-                        } else if try self.shouldFallbackToUSBTunnel(using: cmd, errorMessage: err) {
-                            self.appendLog("Wi‑Fi tunnel 不支援，改用 USB tunnel 重試")
-                            self.activeTunnelConnectionType = .usb
-                            let usbUDID = try self.preferredTunnelUDID(using: cmd)
-                            self.setStage("切換連線方式")
-                            try self.startTunnelAndResolveEndpoint(using: cmd, udid: usbUDID)
-                        } else {
-                            throw error
-                        }
-                    }
 
-                    guard let ep = self.rsdEndpoint else {
-                        throw NSError(domain: "DeviceManager", code: -1, userInfo: [
-                            NSLocalizedDescriptionKey: "無法取得 RSD host/port"
-                        ])
+                        guard let ep = self.rsdEndpoint else {
+                            throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                                NSLocalizedDescriptionKey: "無法取得 RSD host/port"
+                            ])
+                        }
+                        try self.verifyRsdEndpoint(using: cmd, ep: ep)
                     }
-                    try self.verifyRsdEndpoint(using: cmd, ep: ep)
-                }
-                guard let ep = self.rsdEndpoint else {
-                    throw NSError(domain: "DeviceManager", code: -1, userInfo: [
-                        NSLocalizedDescriptionKey: "RSD endpoint 在連線完成前遺失，請重試"
-                    ])
                 }
                 let deviceLabel = self.connectedDeviceLabel(using: cmd)
-
-                self.setConnectionState(.connected, deviceName: "\(deviceLabel) (RSD: \(ep.host):\(ep.port))", lastError: nil)
-                DispatchQueue.main.async {
-                    print("✅ Tunnel OK: \(ep.host):\(ep.port)")
+                if let ep = self.rsdEndpoint {
+                    self.setConnectionState(.connected, deviceName: "\(deviceLabel) (RSD: \(ep.host):\(ep.port))", lastError: nil)
+                    DispatchQueue.main.async {
+                        print("✅ Tunnel OK: \(ep.host):\(ep.port)")
+                    }
+                } else if let directUDID = self.directDeviceUDID {
+                    self.setConnectionState(.connected, deviceName: "\(deviceLabel) (USB 直連: \(directUDID))", lastError: nil)
+                    DispatchQueue.main.async {
+                        print("✅ Legacy USB OK: \(directUDID)")
+                    }
+                } else {
+                    throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                        NSLocalizedDescriptionKey: "連線完成前未取得有效的裝置通道"
+                    ])
                 }
                 self.appendLog("連線完成，模式：\(self.simulateLocationMode?.rawValue ?? "unknown")")
                 self.cancelAutoReconnect()
@@ -443,9 +458,77 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         return nil
     }
 
+    private func preferredConnectedDevice(using cmd: [String]) throws -> USBMuxDevice {
+        let devices = try listConnectedDevices(using: cmd)
+        guard !devices.isEmpty else {
+            throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "未偵測到已連線的 iPhone/iPad。請確認裝置已用 USB 接上、已解鎖並信任這台 Mac，且 Finder 或 Xcode 能看到裝置；若你已知 RSD，也可在進階連線直接輸入 host/port。"
+            ])
+        }
+
+        appendLog("偵測到裝置：" + devices.map(deviceDebugLabel(for:)).joined(separator: "、"))
+
+        if let requested = effectiveTunnelUDID,
+           let matched = devices.first(where: { matchesDevice($0, requestedUDID: requested) }) {
+            return matched
+        }
+
+        if isWirelessMode,
+           let activeUDID = try preferredActiveDeviceUDID(using: cmd),
+           let matched = devices.first(where: { matchesDevice($0, requestedUDID: activeUDID) }) {
+            return matched
+        }
+
+        return devices.first(where: { ($0.connectionType ?? "").uppercased() == "USB" }) ?? devices[0]
+    }
+
+    private func shouldUseDirectUSBConnection(for device: USBMuxDevice) -> Bool {
+        guard let productVersion = device.productVersion else { return false }
+        let major = Int(productVersion.split(separator: ".").first ?? "") ?? 0
+        return major > 0 && major < 17
+    }
+
+    private func directDeviceEnvironment(udid: String) -> [String: String] {
+        ["PYMOBILEDEVICE3_UDID": udid]
+    }
+
+    private func connectLegacyDevice(using cmd: [String], device: USBMuxDevice) throws {
+        guard let udid = device.identifier ?? device.uniqueDeviceID else {
+            throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "找不到可用的裝置識別碼，無法建立 USB 直連"
+            ])
+        }
+
+        stopTunnel()
+        setStage("使用 USB 直連")
+        appendLog("偵測到 iOS \(device.productVersion ?? "未知")，改用舊版 USB 直連流程")
+
+        try ensureDeveloperModeEnabledIfSupported(using: cmd, udid: udid)
+
+        _ = try runWithTimeoutLogged(
+            cmd + ["mounter", "auto-mount"],
+            timeout: AppConstants.Timeouts.mountTimeout,
+            step: "掛載 Developer Disk Image（USB 直連）",
+            environment: directDeviceEnvironment(udid: udid)
+        )
+
+        _ = try runWithTimeoutLogged(
+            cmd + ["developer", "simulate-location", "clear"],
+            timeout: AppConstants.Timeouts.rsdInfo,
+            step: "測試 legacy simulate-location",
+            environment: directDeviceEnvironment(udid: udid)
+        )
+
+        rsdEndpoint = nil
+        directDeviceUDID = udid
+        simulateLocationMode = .legacy
+    }
+
     private func verifyRsdEndpoint(using cmd: [String], ep: Endpoint) throws {
         setStage("驗證裝置服務")
         appendLog("RSD endpoint: \(ep.host):\(ep.port)")
+
+        try ensureDeveloperModeEnabledIfSupported(using: cmd, ep: ep)
 
         _ = try runWithTimeoutLogged(cmd + [
             "mounter", "auto-mount",
@@ -479,6 +562,71 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
             step: "嘗試 legacy clear"
         )
         return .legacy
+    }
+
+    private func ensureDeveloperModeEnabledIfSupported(using cmd: [String], ep: Endpoint) throws {
+        let output: String
+        do {
+            output = try runWithTimeoutLogged(
+                cmd + [
+                    "mounter", "query-developer-mode-status",
+                    "--rsd", ep.host, ep.port
+                ],
+                timeout: AppConstants.Timeouts.rsdInfo,
+                step: "檢查開發者模式"
+            )
+        } catch {
+            let lowered = error.localizedDescription.lowercased()
+            if lowered.contains("message not supported")
+                || lowered.contains("unknown command")
+                || lowered.contains("unknowncommand") {
+                appendLog("開發者模式狀態查詢不支援，略過檢查")
+                return
+            }
+            throw error
+        }
+
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if trimmed == "true" { return }
+        if trimmed == "false" {
+            throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "裝置尚未開啟開發者模式。請先到 iPhone/iPad 的「設定 > 隱私權與安全性 > 開發者模式」開啟，並依提示重新啟動裝置後再重試。"
+            ])
+        }
+
+        appendLog("無法判斷開發者模式狀態，略過強制檢查")
+    }
+
+    private func ensureDeveloperModeEnabledIfSupported(using cmd: [String], udid: String) throws {
+        let output: String
+        do {
+            output = try runWithTimeoutLogged(
+                cmd + ["mounter", "query-developer-mode-status"],
+                timeout: AppConstants.Timeouts.rsdInfo,
+                step: "檢查開發者模式（USB 直連）",
+                environment: directDeviceEnvironment(udid: udid)
+            )
+        } catch {
+            let lowered = error.localizedDescription.lowercased()
+            if lowered.contains("message not supported")
+                || lowered.contains("unknown command")
+                || lowered.contains("unknowncommand")
+                || lowered.contains("your ios version doesn't support this command") {
+                appendLog("開發者模式狀態查詢不支援，略過檢查")
+                return
+            }
+            throw error
+        }
+
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if trimmed == "true" { return }
+        if trimmed == "false" {
+            throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "裝置尚未開啟開發者模式。請先到 iPhone/iPad 的「設定 > 隱私權與安全性 > 開發者模式」開啟，並依提示重新啟動裝置後再重試。"
+            ])
+        }
+
+        appendLog("無法判斷開發者模式狀態，略過強制檢查")
     }
 
     private var effectiveTunnelUDID: String? {
@@ -771,16 +919,27 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
     func clearSimulatedLocation() {
         guard isConnected else { return }
         sendQueue.async { [weak self] in
-            guard let self, let ep = self.rsdEndpoint else { return }
+            guard let self else { return }
             do {
                 let cmd = try self.resolveCLI()
-                let mode = self.simulateLocationMode ?? .legacy
                 self.dvtStream.clear()
-                _ = try self.runWithTimeoutLogged(
-                    cmd + mode.clearArgs(host: ep.host, port: ep.port),
-                    timeout: AppConstants.Timeouts.rsdInfo,
-                    step: "清除模擬定位"
-                )
+                if let ep = self.rsdEndpoint {
+                    let mode = self.simulateLocationMode ?? .legacy
+                    _ = try self.runWithTimeoutLogged(
+                        cmd + mode.clearArgs(host: ep.host, port: ep.port),
+                        timeout: AppConstants.Timeouts.rsdInfo,
+                        step: "清除模擬定位"
+                    )
+                } else if let udid = self.directDeviceUDID {
+                    _ = try self.runWithTimeoutLogged(
+                        cmd + ["developer", "simulate-location", "clear"],
+                        timeout: AppConstants.Timeouts.rsdInfo,
+                        step: "清除模擬定位（USB 直連）",
+                        environment: self.directDeviceEnvironment(udid: udid)
+                    )
+                } else {
+                    return
+                }
                 print("🧹 已清除模擬定位")
             } catch {
                 print("⚠️ 清除失敗: \(error.localizedDescription)")
@@ -799,21 +958,30 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
                     ]))
                     return
                 }
-                guard let ep = self.rsdEndpoint else {
+                guard self.rsdEndpoint != nil || self.directDeviceUDID != nil else {
                     continuation.resume(throwing: NSError(domain: "DeviceManager", code: -1, userInfo: [
-                        NSLocalizedDescriptionKey: "RSD 未就緒"
+                        NSLocalizedDescriptionKey: "裝置通道未就緒"
                     ]))
                     return
                 }
                 do {
                     let cmd = try self.resolveCLI()
-                    let mode = self.simulateLocationMode ?? .legacy
                     self.dvtStream.clear()
-                    _ = try self.runWithTimeoutLogged(
-                        cmd + mode.clearArgs(host: ep.host, port: ep.port),
-                        timeout: AppConstants.Timeouts.rsdInfo,
-                        step: "清除模擬定位"
-                    )
+                    if let ep = self.rsdEndpoint {
+                        let mode = self.simulateLocationMode ?? .legacy
+                        _ = try self.runWithTimeoutLogged(
+                            cmd + mode.clearArgs(host: ep.host, port: ep.port),
+                            timeout: AppConstants.Timeouts.rsdInfo,
+                            step: "清除模擬定位"
+                        )
+                    } else if let udid = self.directDeviceUDID {
+                        _ = try self.runWithTimeoutLogged(
+                            cmd + ["developer", "simulate-location", "clear"],
+                            timeout: AppConstants.Timeouts.rsdInfo,
+                            step: "清除模擬定位（USB 直連）",
+                            environment: self.directDeviceEnvironment(udid: udid)
+                        )
+                    }
                     continuation.resume()
                 } catch {
                     self.appendLog("清除模擬定位失敗：\(error.localizedDescription)")
@@ -832,8 +1000,8 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
             if pendingCoordinate != nil { flushLatestCoordinate() }
         }
 
-        guard rsdEndpoint != nil else {
-            setConnectionState(.failed, deviceName: "RSD 未就緒，請重連", lastError: "RSD 未就緒")
+        guard rsdEndpoint != nil || directDeviceUDID != nil else {
+            setConnectionState(.failed, deviceName: "裝置通道未就緒，請重連", lastError: "裝置通道未就緒")
             return
         }
 
@@ -1007,6 +1175,7 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
 
     private func stopTunnel() {
         rsdEndpoint = nil
+        directDeviceUDID = nil
         simulateLocationMode = nil
         activeTunnelConnectionType = nil
         stopSendPipelineSynchronously()
@@ -1114,11 +1283,16 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         }
     }
 
-    private func runWithTimeoutLogged(_ args: [String], timeout: TimeInterval, step: String) throws -> String {
+    private func runWithTimeoutLogged(
+        _ args: [String],
+        timeout: TimeInterval,
+        step: String,
+        environment: [String: String]? = nil
+    ) throws -> String {
         appendLog("▶ \(step)")
         appendLog("cmd: \(args.joined(separator: " "))")
         do {
-            let out = try runWithTimeout(args, timeout: timeout)
+            let out = try runWithTimeout(args, timeout: timeout, environment: environment)
             let trimmed = summarizeOutput(out)
             if !trimmed.isEmpty {
                 appendLog("out: \(trimmed)")
@@ -1143,27 +1317,38 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
     }
 
     private func sendCoordinateByLegacyCommand(latitude: Double, longitude: Double) throws {
-        guard let ep = rsdEndpoint else {
-            throw NSError(domain: "DeviceManager", code: -1, userInfo: [
-                NSLocalizedDescriptionKey: "RSD 未就緒"
-            ])
-        }
         let cmd = try resolveCLI()
-        let mode = simulateLocationMode ?? .legacy
-        _ = try runWithTimeout(
-            cmd + mode.setArgs(host: ep.host, port: ep.port, latitude: latitude, longitude: longitude),
-            timeout: AppConstants.Timeouts.coordinateSend
-        )
+        if let ep = rsdEndpoint {
+            let mode = simulateLocationMode ?? .legacy
+            _ = try runWithTimeout(
+                cmd + mode.setArgs(host: ep.host, port: ep.port, latitude: latitude, longitude: longitude),
+                timeout: AppConstants.Timeouts.coordinateSend
+            )
+            return
+        }
+        if let udid = directDeviceUDID {
+            let lat = String(format: AppConstants.Formatting.coordinatePrecision, latitude)
+            let lon = String(format: AppConstants.Formatting.coordinatePrecision, longitude)
+            _ = try runWithTimeout(
+                cmd + ["developer", "simulate-location", "set", lat, lon],
+                timeout: AppConstants.Timeouts.coordinateSend,
+                environment: directDeviceEnvironment(udid: udid)
+            )
+            return
+        }
+        throw NSError(domain: "DeviceManager", code: -1, userInfo: [
+            NSLocalizedDescriptionKey: "裝置通道未就緒"
+        ])
     }
 
     private func sendCoordinate(latitude: Double, longitude: Double) throws {
-        guard let ep = rsdEndpoint else {
+        guard rsdEndpoint != nil || directDeviceUDID != nil else {
             throw NSError(domain: "DeviceManager", code: -1, userInfo: [
-                NSLocalizedDescriptionKey: "RSD 未就緒"
+                NSLocalizedDescriptionKey: "裝置通道未就緒"
             ])
         }
 
-        if simulateLocationMode == .dvt {
+        if let ep = rsdEndpoint, simulateLocationMode == .dvt {
             try startDvtStreamIfNeeded(host: ep.host, port: ep.port)
             try dvtStream.send(latitude: latitude, longitude: longitude)
             return
@@ -1200,18 +1385,29 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         )
     }
 
-    private func run(_ args: [String]) throws -> String {
-        try runProcess(args, timeout: nil)
+    private func run(_ args: [String], environment: [String: String]? = nil) throws -> String {
+        try runProcess(args, timeout: nil, environment: environment)
     }
 
-    private func runWithTimeout(_ args: [String], timeout: TimeInterval) throws -> String {
-        try runProcess(args, timeout: timeout)
+    private func runWithTimeout(
+        _ args: [String],
+        timeout: TimeInterval,
+        environment: [String: String]? = nil
+    ) throws -> String {
+        try runProcess(args, timeout: timeout, environment: environment)
     }
 
-    private func runProcess(_ args: [String], timeout: TimeInterval?) throws -> String {
+    private func runProcess(
+        _ args: [String],
+        timeout: TimeInterval?,
+        environment: [String: String]? = nil
+    ) throws -> String {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         p.arguments = args
+        if let environment {
+            p.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+        }
         p.standardInput = FileHandle.nullDevice
 
         let out = Pipe()
